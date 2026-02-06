@@ -1,0 +1,144 @@
+Menu="Utilities"
+Title="File Hasher"
+Icon="fa-shield-alt"
+---
+<?php
+$plugin = 'filehasher';
+$pidFile = '/var/run/filehasher.pid';
+$binary = '/usr/local/bin/filehasher';
+$port = 8787;
+
+// Check service status
+$running = false;
+$pid = '';
+if (file_exists($pidFile)) {
+    $pid = trim(file_get_contents($pidFile));
+    if ($pid && posix_kill((int)$pid, 0)) {
+        $running = true;
+    }
+}
+
+// Get version
+$version = 'unknown';
+if (is_executable($binary)) {
+    exec("$binary --version 2>&1", $output);
+    if (!empty($output[0])) {
+        $version = trim($output[0]);
+    }
+}
+
+// Build dashboard URL using the host the browser connected to
+$host = $_SERVER['HTTP_HOST'];
+// Strip any existing port from the host header
+$host = preg_replace('/:\d+$/', '', $host);
+$dashboardUrl = "http://{$host}:{$port}";
+?>
+
+<style>
+.fh-status-card {
+    background: #1a1d21;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    padding: 24px;
+    max-width: 480px;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+}
+.fh-status-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 8px 0;
+    border-bottom: 1px solid #21262d;
+}
+.fh-status-row:last-child {
+    border-bottom: none;
+}
+.fh-label {
+    color: #8b949e;
+    font-size: 14px;
+}
+.fh-value {
+    color: #c9d1d9;
+    font-size: 14px;
+    font-weight: 500;
+}
+.fh-badge {
+    display: inline-block;
+    padding: 2px 10px;
+    border-radius: 12px;
+    font-size: 12px;
+    font-weight: 600;
+}
+.fh-badge-running {
+    background: #0d1117;
+    border: 1px solid #238636;
+    color: #3fb950;
+}
+.fh-badge-stopped {
+    background: #0d1117;
+    border: 1px solid #da3633;
+    color: #f85149;
+}
+.fh-btn {
+    display: inline-block;
+    margin-top: 16px;
+    padding: 10px 24px;
+    background: #238636;
+    color: #fff;
+    border: 1px solid #2ea043;
+    border-radius: 6px;
+    font-size: 14px;
+    font-weight: 600;
+    text-decoration: none;
+    cursor: pointer;
+    transition: background 0.15s;
+}
+.fh-btn:hover {
+    background: #2ea043;
+    color: #fff;
+    text-decoration: none;
+}
+.fh-btn:disabled, .fh-btn-disabled {
+    background: #21262d;
+    border-color: #30363d;
+    color: #484f58;
+    cursor: not-allowed;
+}
+</style>
+
+<div class="fh-status-card">
+    <div class="fh-status-row">
+        <span class="fh-label">Service</span>
+        <span class="fh-value">
+            <?if ($running):?>
+                <span class="fh-badge fh-badge-running">Running</span>
+            <?else:?>
+                <span class="fh-badge fh-badge-stopped">Stopped</span>
+            <?endif;?>
+        </span>
+    </div>
+    <div class="fh-status-row">
+        <span class="fh-label">Version</span>
+        <span class="fh-value"><?=$version?></span>
+    </div>
+    <?if ($running && $pid):?>
+    <div class="fh-status-row">
+        <span class="fh-label">PID</span>
+        <span class="fh-value"><?=$pid?></span>
+    </div>
+    <?endif;?>
+    <div class="fh-status-row">
+        <span class="fh-label">Port</span>
+        <span class="fh-value"><?=$port?></span>
+    </div>
+    <div class="fh-status-row">
+        <span class="fh-label">Database</span>
+        <span class="fh-value">/boot/config/filehasher/filehasher.db</span>
+    </div>
+
+    <?if ($running):?>
+        <a class="fh-btn" href="<?=$dashboardUrl?>" target="_blank">Open Dashboard</a>
+    <?else:?>
+        <span class="fh-btn fh-btn-disabled">Dashboard Unavailable</span>
+    <?endif;?>
+</div>

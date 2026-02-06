@@ -1,0 +1,17 @@
+# Build artifacts
+filehasher
+build/
+
+# SQLite database files
+*.db
+*.db-wal
+*.db-shm
+
+# IDE / OS files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db

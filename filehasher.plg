@@ -1,0 +1,152 @@
+<?xml version='1.0' standalone='yes'?>
+<!DOCTYPE PLUGIN [
+  <!ENTITY name      "filehasher">
+  <!ENTITY author    "filehasher">
+  <!ENTITY version   "2026.02.06">
+  <!ENTITY gitURL    "https://github.com/OWNER/filehasher">
+  <!ENTITY pluginURL "&gitURL;/releases/latest/download/filehasher.plg">
+  <!ENTITY pkgURL    "&gitURL;/releases/download/v&version;/filehasher-linux-amd64.tar.gz">
+]>
+
+<PLUGIN  name="&name;" author="&author;" version="&version;" pluginURL="&pluginURL;" min="6.12.0">
+
+<CHANGES>
+## v&version;
+- Initial release
+- SHA-256 file integrity checking for all array disks and cache pools
+- Incremental scan (only re-hash changed files)
+- Per-disk worker counts (1 for HDD, 4 for SSD)
+- Web dashboard on port 8787
+- CLI: scan, verify, report, server commands
+</CHANGES>
+
+<!--
+Download the release tarball.
+-->
+<FILE Name="/boot/config/plugins/&name;/filehasher-linux-amd64.tar.gz">
+<URL>&pkgURL;</URL>
+</FILE>
+
+<!--
+Install the binary and start the web dashboard.
+Runs on install and on every boot (Unraid re-processes .plg files at startup).
+-->
+<FILE Run="/bin/bash" Method="install">
+<INLINE>
+#!/bin/bash
+
+# Create persistent config directory on USB boot drive
+mkdir -p /boot/config/filehasher
+
+# Extract binary (tarball contains a single "filehasher" binary)
+tar xzf /boot/config/plugins/&name;/filehasher-linux-amd64.tar.gz -C /usr/local/bin/
+chmod +x /usr/local/bin/filehasher
+
+# Start web dashboard if not already running
+PIDFILE="/var/run/filehasher.pid"
+if [ -f "$PIDFILE" ]; then
+  OLD_PID=$(cat "$PIDFILE")
+  if kill -0 "$OLD_PID" 2>/dev/null; then
+    echo "filehasher dashboard already running (PID $OLD_PID)"
+  else
+    rm -f "$PIDFILE"
+  fi
+fi
+
+if [ ! -f "$PIDFILE" ]; then
+  nohup /usr/local/bin/filehasher server -p 8787 &gt;/var/log/filehasher-web.log 2&gt;&amp;1 &amp;
+  echo $! > "$PIDFILE"
+  echo "filehasher dashboard started on port 8787 (PID $(cat $PIDFILE))"
+fi
+
+echo ""
+echo "filehasher v&version; installed"
+echo "  Binary:    /usr/local/bin/filehasher"
+echo "  Database:  /boot/config/filehasher/filehasher.db"
+echo "  Dashboard: http://$(hostname):8787"
+echo ""
+echo "CLI usage:"
+echo "  filehasher scan --auto       # Scan all Unraid disks"
+echo "  filehasher verify            # Check file integrity"
+echo "  filehasher report            # Show status report"
+</INLINE>
+</FILE>
+
+<!--
+Cron job: weekly verification (runs Sunday at 3 AM).
+Edit /boot/config/filehasher/cron.cfg to customize.
+-->
+<FILE Name="/boot/config/plugins/&name;/filehasher-cron" Run="/bin/bash">
+<INLINE>
+#!/bin/bash
+
+# Create default cron config if it doesn't exist
+CRON_CFG="/boot/config/filehasher/cron.cfg"
+if [ ! -f "$CRON_CFG" ]; then
+  cat > "$CRON_CFG" &lt;&lt;'CRONEOF'
+# filehasher cron schedule
+# Set ENABLED=yes to enable automatic verification
+ENABLED=no
+# Cron schedule (default: Sunday 3 AM)
+SCHEDULE=0 3 * * 0
+# Verify mode: "full" or "quick"
+MODE=full
+CRONEOF
+fi
+
+# Source the config
+source "$CRON_CFG"
+
+# Install or remove cron entry based on config
+CRON_FILE="/etc/cron.d/filehasher"
+if [ "$ENABLED" = "yes" ]; then
+  VERIFY_CMD="/usr/local/bin/filehasher verify"
+  if [ "$MODE" = "quick" ]; then
+    VERIFY_CMD="$VERIFY_CMD --quick"
+  fi
+  echo "$SCHEDULE root $VERIFY_CMD >> /var/log/filehasher.log 2>&amp;1" > "$CRON_FILE"
+  echo "filehasher cron job installed: $SCHEDULE"
+else
+  rm -f "$CRON_FILE"
+  echo "filehasher cron job disabled (edit $CRON_CFG to enable)"
+fi
+</INLINE>
+</FILE>
+
+<!--
+Remove plugin.
+-->
+<FILE Run="/bin/bash" Method="remove">
+<INLINE>
+#!/bin/bash
+
+# Stop web dashboard
+PIDFILE="/var/run/filehasher.pid"
+if [ -f "$PIDFILE" ]; then
+  PID=$(cat "$PIDFILE")
+  if kill -0 "$PID" 2>/dev/null; then
+    kill "$PID"
+    echo "filehasher dashboard stopped (PID $PID)"
+  fi
+  rm -f "$PIDFILE"
+fi
+
+# Remove binary
+rm -f /usr/local/bin/filehasher
+
+# Remove cron job
+rm -f /etc/cron.d/filehasher
+
+# Remove plugin package files (but keep the database on USB for safety)
+rm -rf /boot/config/plugins/&name;
+
+# Remove log files
+rm -f /var/log/filehasher-web.log
+
+echo "filehasher removed."
+echo "Note: Database preserved at /boot/config/filehasher/filehasher.db"
+echo "To fully remove: rm -rf /boot/config/filehasher/"
+</INLINE>
+</FILE>
+
+</PLUGIN>

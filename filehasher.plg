@@ -48,13 +48,36 @@ mkdir -p "$PAGE_DIR"
 cat > "$PAGE_DIR/FileHasher.page" &lt;&lt;'PAGEOF'
 Menu="Utilities"
 Title="File Hasher"
-Icon="fa-shield-alt"
+Icon="fa-shield"
 ---
 &lt;?php
 $plugin = 'filehasher';
 $pidFile = '/var/run/filehasher.pid';
 $binary = '/usr/local/bin/filehasher';
 $port = 8787;
+$logFile = '/var/log/filehasher-web.log';
+
+// Handle start/stop actions
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $action = $_POST['action'] ?? '';
+
+    if ($action === 'start' &amp;&amp; is_executable($binary)) {
+        exec("nohup $binary server -p $port &gt;$logFile 2&gt;&amp;1 &amp; echo \$!", $out);
+        if (!empty($out[0])) {
+            file_put_contents($pidFile, $out[0]);
+            sleep(1);
+        }
+    } elseif ($action === 'stop' &amp;&amp; file_exists($pidFile)) {
+        $pid = trim(file_get_contents($pidFile));
+        if ($pid) {
+            exec("kill $pid 2&gt;/dev/null");
+        }
+        unlink($pidFile);
+    }
+
+    header("Location: " . $_SERVER['REQUEST_URI']);
+    exit;
+}
 
 $running = false;
 $pid = '';
@@ -62,6 +85,9 @@ if (file_exists($pidFile)) {
     $pid = trim(file_get_contents($pidFile));
     if ($pid &amp;&amp; posix_kill((int)$pid, 0)) {
         $running = true;
+    } else {
+        @unlink($pidFile);
+        $pid = '';
     }
 }
 
@@ -125,7 +151,6 @@ $dashboardUrl = "http://{$host}:{$port}";
 }
 .fh-btn {
     display: inline-block;
-    margin-top: 16px;
     padding: 10px 24px;
     background: #238636;
     color: #fff;
@@ -142,11 +167,29 @@ $dashboardUrl = "http://{$host}:{$port}";
     color: #fff;
     text-decoration: none;
 }
+.fh-btn-stop {
+    background: #da3633;
+    border-color: #f85149;
+}
+.fh-btn-stop:hover {
+    background: #f85149;
+}
 .fh-btn-disabled {
     background: #21262d;
     border-color: #30363d;
     color: #484f58;
     cursor: not-allowed;
+}
+.fh-actions {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    margin-top: 16px;
+}
+.fh-actions form {
+    display: inline;
+    margin: 0;
+    padding: 0;
 }
 &lt;/style&gt;
 
@@ -180,11 +223,20 @@ $dashboardUrl = "http://{$host}:{$port}";
         &lt;span class="fh-value"&gt;/boot/config/filehasher/filehasher.db&lt;/span&gt;
     &lt;/div&gt;
 
-    &lt;?if ($running):?&gt;
-        &lt;a class="fh-btn" href="&lt;?=$dashboardUrl?&gt;" target="_blank"&gt;Open Dashboard&lt;/a&gt;
-    &lt;?else:?&gt;
-        &lt;span class="fh-btn fh-btn-disabled"&gt;Dashboard Unavailable&lt;/span&gt;
-    &lt;?endif;?&gt;
+    &lt;div class="fh-actions"&gt;
+        &lt;?if ($running):?&gt;
+            &lt;a class="fh-btn" href="&lt;?=$dashboardUrl?&gt;" target="_blank"&gt;Open Dashboard&lt;/a&gt;
+            &lt;form method="post"&gt;
+                &lt;input type="hidden" name="action" value="stop"&gt;
+                &lt;button type="submit" class="fh-btn fh-btn-stop"&gt;Stop&lt;/button&gt;
+            &lt;/form&gt;
+        &lt;?else:?&gt;
+            &lt;form method="post"&gt;
+                &lt;input type="hidden" name="action" value="start"&gt;
+                &lt;button type="submit" class="fh-btn"&gt;Start&lt;/button&gt;
+            &lt;/form&gt;
+        &lt;?endif;?&gt;
+    &lt;/div&gt;
 &lt;/div&gt;
 PAGEOF
 

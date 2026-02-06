@@ -10,12 +10,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/filehasher/filehasher/internal/db"
-	"github.com/filehasher/filehasher/internal/format"
-	"github.com/filehasher/filehasher/internal/hasher"
-	"github.com/filehasher/filehasher/internal/scanner"
-	"github.com/filehasher/filehasher/internal/verifier"
-	"github.com/filehasher/filehasher/internal/web"
+	"github.com/maisi/unraid-filehasher/internal/db"
+	"github.com/maisi/unraid-filehasher/internal/format"
+	"github.com/maisi/unraid-filehasher/internal/hasher"
+	"github.com/maisi/unraid-filehasher/internal/scanner"
+	"github.com/maisi/unraid-filehasher/internal/verifier"
+	"github.com/maisi/unraid-filehasher/internal/web"
 	"github.com/spf13/cobra"
 )
 

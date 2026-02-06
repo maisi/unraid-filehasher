@@ -10,7 +10,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/filehasher/filehasher/internal/hasher"
+	"github.com/maisi/unraid-filehasher/internal/hasher"
 )
 
 // DiskType represents the storage type of a disk.

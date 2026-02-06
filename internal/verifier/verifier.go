@@ -7,8 +7,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/filehasher/filehasher/internal/db"
-	"github.com/filehasher/filehasher/internal/hasher"
+	"github.com/maisi/unraid-filehasher/internal/db"
+	"github.com/maisi/unraid-filehasher/internal/hasher"
 )
 
 // VerifyResult represents the outcome of verifying a single file.

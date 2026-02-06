@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/filehasher/filehasher/internal/hasher"
+	"github.com/maisi/unraid-filehasher/internal/hasher"
 )
 
 func TestResolveDisk(t *testing.T) {

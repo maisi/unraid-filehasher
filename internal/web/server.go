@@ -8,8 +8,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/filehasher/filehasher/internal/db"
-	"github.com/filehasher/filehasher/internal/format"
+	"github.com/maisi/unraid-filehasher/internal/db"
+	"github.com/maisi/unraid-filehasher/internal/format"
 )
 
 // Serve starts the web dashboard on the given address.

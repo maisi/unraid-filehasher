@@ -3,7 +3,7 @@
   <!ENTITY name      "filehasher">
   <!ENTITY author    "filehasher">
   <!ENTITY version   "2026.02.06">
-  <!ENTITY gitURL    "https://github.com/OWNER/filehasher">
+  <!ENTITY gitURL    "https://github.com/maisi/unraid-filehasher">
   <!ENTITY pluginURL "&gitURL;/releases/latest/download/filehasher.plg">
   <!ENTITY pkgURL    "&gitURL;/releases/download/v&version;/filehasher-linux-amd64.tar.gz">
 ]>

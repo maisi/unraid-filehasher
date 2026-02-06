@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/filehasher/filehasher/internal/db"
+	"github.com/maisi/unraid-filehasher/internal/db"
 )
 
 func setupTestDB(t *testing.T) *db.DB {

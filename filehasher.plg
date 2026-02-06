@@ -75,9 +75,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         unlink($pidFile);
     }
 
-    header("Location: " . $_SERVER['REQUEST_URI']);
-    exit;
-}
+    }
 
 $running = false;
 $pid = '';
@@ -226,7 +224,7 @@ $dashboardUrl = "http://{$host}:{$port}";
     &lt;div class="fh-actions"&gt;
         &lt;?if ($running):?&gt;
             &lt;a class="fh-btn" href="&lt;?=$dashboardUrl?&gt;" target="_blank"&gt;Open Dashboard&lt;/a&gt;
-            &lt;form method="post"&gt;
+             &lt;form method="post"&gt;
                 &lt;input type="hidden" name="action" value="stop"&gt;
                 &lt;button type="submit" class="fh-btn fh-btn-stop"&gt;Stop&lt;/button&gt;
             &lt;/form&gt;
@@ -238,6 +236,12 @@ $dashboardUrl = "http://{$host}:{$port}";
         &lt;?endif;?&gt;
     &lt;/div&gt;
 &lt;/div&gt;
+
+&lt;script&gt;
+if (window.history.replaceState) {
+    window.history.replaceState(null, '', window.location.href);
+}
+&lt;/script&gt;
 PAGEOF
 
 # Start web dashboard if not already running

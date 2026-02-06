@@ -27,9 +27,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         unlink($pidFile);
     }
 
-    // Redirect to avoid form resubmission
-    header("Location: " . $_SERVER['REQUEST_URI']);
-    exit;
 }
 
 // Check service status
@@ -196,3 +193,10 @@ $dashboardUrl = "http://{$host}:{$port}";
         <?endif;?>
     </div>
 </div>
+
+<script>
+// Clear POST state from browser history to prevent form resubmission on refresh
+if (window.history.replaceState) {
+    window.history.replaceState(null, '', window.location.href);
+}
+</script>

@@ -55,27 +55,7 @@ $plugin = 'filehasher';
 $pidFile = '/var/run/filehasher.pid';
 $binary = '/usr/local/bin/filehasher';
 $port = 8787;
-$logFile = '/var/log/filehasher-web.log';
-
-// Handle start/stop actions
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $action = $_POST['action'] ?? '';
-
-    if ($action === 'start' &amp;&amp; is_executable($binary)) {
-        exec("nohup $binary server -p $port &gt;$logFile 2&gt;&amp;1 &amp; echo \$!", $out);
-        if (!empty($out[0])) {
-            file_put_contents($pidFile, $out[0]);
-            sleep(1);
-        }
-    } elseif ($action === 'stop' &amp;&amp; file_exists($pidFile)) {
-        $pid = trim(file_get_contents($pidFile));
-        if ($pid) {
-            exec("kill $pid 2&gt;/dev/null");
-        }
-        unlink($pidFile);
-    }
-
-    }
+$controlScript = "/usr/local/emhttp/plugins/$plugin/scripts/control";
 
 $running = false;
 $pid = '';
@@ -224,13 +204,15 @@ $dashboardUrl = "http://{$host}:{$port}";
     &lt;div class="fh-actions"&gt;
         &lt;?if ($running):?&gt;
             &lt;a class="fh-btn" href="&lt;?=$dashboardUrl?&gt;" target="_blank"&gt;Open Dashboard&lt;/a&gt;
-             &lt;form method="post"&gt;
-                &lt;input type="hidden" name="action" value="stop"&gt;
+            &lt;form method="POST" action="/update.php" target="progressFrame"&gt;
+                &lt;input type="hidden" name="#command" value="&lt;?=$controlScript?&gt;"&gt;
+                &lt;input type="hidden" name="#arg[1]" value="stop"&gt;
                 &lt;button type="submit" class="fh-btn fh-btn-stop"&gt;Stop&lt;/button&gt;
             &lt;/form&gt;
         &lt;?else:?&gt;
-            &lt;form method="post"&gt;
-                &lt;input type="hidden" name="action" value="start"&gt;
+            &lt;form method="POST" action="/update.php" target="progressFrame"&gt;
+                &lt;input type="hidden" name="#command" value="&lt;?=$controlScript?&gt;"&gt;
+                &lt;input type="hidden" name="#arg[1]" value="start"&gt;
                 &lt;button type="submit" class="fh-btn"&gt;Start&lt;/button&gt;
             &lt;/form&gt;
         &lt;?endif;?&gt;
@@ -238,11 +220,57 @@ $dashboardUrl = "http://{$host}:{$port}";
 &lt;/div&gt;
 
 &lt;script&gt;
-if (window.history.replaceState) {
-    window.history.replaceState(null, '', window.location.href);
-}
+document.querySelectorAll('.fh-actions form').forEach(function(form) {
+    form.addEventListener('submit', function() {
+        setTimeout(function() { location.reload(); }, 2000);
+    });
+});
 &lt;/script&gt;
 PAGEOF
+
+# Install control script for start/stop
+mkdir -p "$PAGE_DIR/scripts"
+cat &gt; "$PAGE_DIR/scripts/control" &lt;&lt;'CTLEOF'
+#!/bin/bash
+BINARY="/usr/local/bin/filehasher"
+PIDFILE="/var/run/filehasher.pid"
+PORT=8787
+LOGFILE="/var/log/filehasher-web.log"
+
+case "$1" in
+    start)
+        if [ -f "$PIDFILE" ]; then
+            OLD_PID=$(cat "$PIDFILE")
+            if kill -0 "$OLD_PID" 2&gt;/dev/null; then
+                echo "filehasher already running (PID $OLD_PID)"
+                exit 0
+            fi
+            rm -f "$PIDFILE"
+        fi
+        nohup "$BINARY" server -p "$PORT" &gt;"$LOGFILE" 2&gt;&amp;1 &amp;
+        echo $! &gt; "$PIDFILE"
+        sleep 1
+        echo "filehasher dashboard started on port $PORT (PID $(cat $PIDFILE))"
+        ;;
+    stop)
+        if [ -f "$PIDFILE" ]; then
+            PID=$(cat "$PIDFILE")
+            if kill -0 "$PID" 2&gt;/dev/null; then
+                kill "$PID"
+                echo "filehasher dashboard stopped (PID $PID)"
+            fi
+            rm -f "$PIDFILE"
+        else
+            echo "filehasher is not running"
+        fi
+        ;;
+    *)
+        echo "Usage: $0 {start|stop}"
+        exit 1
+        ;;
+esac
+CTLEOF
+chmod +x "$PAGE_DIR/scripts/control"
 
 # Start web dashboard if not already running
 PIDFILE="/var/run/filehasher.pid"

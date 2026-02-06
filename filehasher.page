@@ -7,27 +7,7 @@ $plugin = 'filehasher';
 $pidFile = '/var/run/filehasher.pid';
 $binary = '/usr/local/bin/filehasher';
 $port = 8787;
-$logFile = '/var/log/filehasher-web.log';
-
-// Handle start/stop actions
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $action = $_POST['action'] ?? '';
-
-    if ($action === 'start' && is_executable($binary)) {
-        exec("nohup $binary server -p $port >$logFile 2>&1 & echo \$!", $out);
-        if (!empty($out[0])) {
-            file_put_contents($pidFile, $out[0]);
-            sleep(1); // give it a moment to start
-        }
-    } elseif ($action === 'stop' && file_exists($pidFile)) {
-        $pid = trim(file_get_contents($pidFile));
-        if ($pid) {
-            exec("kill $pid 2>/dev/null");
-        }
-        unlink($pidFile);
-    }
-
-}
+$controlScript = "/usr/local/emhttp/plugins/$plugin/scripts/control";
 
 // Check service status
 $running = false;
@@ -181,13 +161,15 @@ $dashboardUrl = "http://{$host}:{$port}";
     <div class="fh-actions">
         <?if ($running):?>
             <a class="fh-btn" href="<?=$dashboardUrl?>" target="_blank">Open Dashboard</a>
-            <form method="post">
-                <input type="hidden" name="action" value="stop">
+            <form method="POST" action="/update.php" target="progressFrame">
+                <input type="hidden" name="#command" value="<?=$controlScript?>">
+                <input type="hidden" name="#arg[1]" value="stop">
                 <button type="submit" class="fh-btn fh-btn-stop">Stop</button>
             </form>
         <?else:?>
-            <form method="post">
-                <input type="hidden" name="action" value="start">
+            <form method="POST" action="/update.php" target="progressFrame">
+                <input type="hidden" name="#command" value="<?=$controlScript?>">
+                <input type="hidden" name="#arg[1]" value="start">
                 <button type="submit" class="fh-btn">Start</button>
             </form>
         <?endif;?>
@@ -195,8 +177,10 @@ $dashboardUrl = "http://{$host}:{$port}";
 </div>
 
 <script>
-// Clear POST state from browser history to prevent form resubmission on refresh
-if (window.history.replaceState) {
-    window.history.replaceState(null, '', window.location.href);
-}
+// Refresh the page after the control script runs (give it a moment to start/stop)
+document.querySelectorAll('.fh-actions form').forEach(function(form) {
+    form.addEventListener('submit', function() {
+        setTimeout(function() { location.reload(); }, 2000);
+    });
+});
 </script>

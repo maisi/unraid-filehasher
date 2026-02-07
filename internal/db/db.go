@@ -220,6 +220,42 @@ func (db *DB) UpdateStatusTx(tx *sql.Tx, path, status string) error {
 	return err
 }
 
+// FindMoveCandidates looks up existing records that could correspond to a moved file.
+// It matches by file basename (path suffix) + size, which is a reasonably strong heuristic
+// without needing to hash the whole catalog.
+func (db *DB) FindMoveCandidates(baseName string, size int64, limit int) ([]*FileRecord, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	rows, err := db.conn.Query(`
+		SELECT id, path, disk, size, mtime, sha256, first_seen, last_verified, status
+		FROM files
+		WHERE size = ? AND path LIKE ?
+		ORDER BY last_verified DESC
+		LIMIT ?
+	`, size, "%/"+baseName, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanFileRows(rows)
+}
+
+// MovePathTx re-keys a record from oldPath to newPath.
+// This is used when a scan determines a file was moved but content stayed identical.
+func (db *DB) MovePathTx(tx *sql.Tx, oldPath, newPath, newDisk string, newSize int64, newMtime int64) error {
+	// If the destination path already exists (e.g., partial previous scan), remove it.
+	if _, err := tx.Exec(`DELETE FROM files WHERE path = ?`, newPath); err != nil {
+		return err
+	}
+	_, err := tx.Exec(`
+		UPDATE files
+		SET path = ?, disk = ?, size = ?, mtime = ?, last_verified = CURRENT_TIMESTAMP, status = 'ok'
+		WHERE path = ?
+	`, newPath, newDisk, newSize, newMtime, oldPath)
+	return err
+}
+
 // GetStats returns aggregate statistics.
 func (db *DB) GetStats() (*Stats, error) {
 	s := &Stats{}

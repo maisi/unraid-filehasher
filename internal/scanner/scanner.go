@@ -116,67 +116,154 @@ func DetectUnraidDisks() ([]DiskInfo, error) {
 // detectDiskType checks /sys/block/<dev>/queue/rotational to determine HDD vs SSD.
 // Returns DiskTypeHDD (rotational=1), DiskTypeSSD (rotational=0), or DiskTypeUnknown.
 func detectDiskType(mountPath string) DiskType {
-	// Find the device for this mount point by reading /proc/mounts
+	// Find the mount source device for this mount point by reading /proc/mounts
 	f, err := os.Open("/proc/mounts")
 	if err != nil {
 		return DiskTypeUnknown
 	}
 	defer f.Close()
 
-	var device string
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		fields := strings.Fields(scanner.Text())
-		if len(fields) >= 2 && fields[1] == mountPath {
-			device = fields[0]
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		fields := strings.Fields(sc.Text())
+		if len(fields) < 2 || fields[1] != mountPath {
+			continue
+		}
+		devBase := filepath.Base(fields[0]) // e.g. "sda1", "md1", "dm-0"
+		return diskTypeFromBlockDevice(devBase)
+	}
+
+	return DiskTypeUnknown
+}
+
+// diskTypeFromBlockDevice attempts to determine HDD/SSD for a given block device name.
+// It is more robust than directly reading /sys/block/<dev>/queue/rotational because Unraid
+// often mounts array disks via /dev/mdX and pools via dm-crypt/LVM/dm devices.
+func diskTypeFromBlockDevice(dev string) DiskType {
+	dev = strings.TrimSpace(dev)
+	if dev == "" {
+		return DiskTypeUnknown
+	}
+
+	// If this is a partition (sda1, nvme0n1p1, etc.), try to map to the parent disk.
+	parent := parentBlockDevice(dev)
+	if parent == "" {
+		parent = dev
+	}
+
+	// If this is a stacked device (md/dm), inspect its slaves.
+	if t := diskTypeFromSlaves(parent); t != DiskTypeUnknown {
+		return t
+	}
+
+	// Fall back to rotational flag.
+	return diskTypeFromRotational(parent)
+}
+
+func parentBlockDevice(dev string) string {
+	// nvme0n1p1 -> nvme0n1
+	if strings.HasPrefix(dev, "nvme") {
+		if idx := strings.LastIndex(dev, "p"); idx > 0 {
+			return dev[:idx]
+		}
+		return dev
+	}
+	// mmcblk0p1 -> mmcblk0
+	if strings.HasPrefix(dev, "mmcblk") {
+		if idx := strings.LastIndex(dev, "p"); idx > 0 {
+			return dev[:idx]
+		}
+		return dev
+	}
+	// sda1 -> sda, vda2 -> vda
+	trimmed := strings.TrimRightFunc(dev, func(r rune) bool { return r >= '0' && r <= '9' })
+	if trimmed == "" {
+		return dev
+	}
+	return trimmed
+}
+
+func diskTypeFromSlaves(dev string) DiskType {
+	slavesDir := filepath.Join("/sys/class/block", dev, "slaves")
+	entries, err := os.ReadDir(slavesDir)
+	if err != nil || len(entries) == 0 {
+		return DiskTypeUnknown
+	}
+
+	seen := 0
+	anyHDD := false
+	allSSD := true
+
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		seen++
+		slave := e.Name()
+		// slave might itself be a partition; normalize
+		slaveParent := parentBlockDevice(slave)
+		if slaveParent == "" {
+			slaveParent = slave
+		}
+		t := diskTypeFromRotational(slaveParent)
+		switch t {
+		case DiskTypeHDD:
+			anyHDD = true
+			allSSD = false
+		case DiskTypeSSD:
+			// keep allSSD true
+		default:
+			allSSD = false
+		}
+	}
+
+	if seen == 0 {
+		return DiskTypeUnknown
+	}
+	if anyHDD {
+		return DiskTypeHDD
+	}
+	if allSSD {
+		return DiskTypeSSD
+	}
+	return DiskTypeUnknown
+}
+
+func diskTypeFromRotational(dev string) DiskType {
+	rot, ok := readRotationalSysfs(dev)
+	if !ok {
+		return DiskTypeUnknown
+	}
+	if rot == "1" {
+		return DiskTypeHDD
+	}
+	if rot == "0" {
+		return DiskTypeSSD
+	}
+	return DiskTypeUnknown
+}
+
+func readRotationalSysfs(dev string) (string, bool) {
+	start := filepath.Join("/sys/class/block", dev)
+	resolved, err := filepath.EvalSymlinks(start)
+	if err != nil {
+		return "", false
+	}
+	// Walk up until we find a queue/rotational file.
+	p := resolved
+	for i := 0; i < 6; i++ {
+		rotPath := filepath.Join(p, "queue", "rotational")
+		data, err := os.ReadFile(rotPath)
+		if err == nil {
+			return strings.TrimSpace(string(data)), true
+		}
+		parent := filepath.Dir(p)
+		if parent == p {
 			break
 		}
+		p = parent
 	}
-
-	if device == "" {
-		return DiskTypeUnknown
-	}
-
-	// Extract the base device name (e.g., /dev/sda1 -> sda, /dev/nvme0n1p1 -> nvme0n1)
-	devBase := filepath.Base(device)
-
-	// Strip partition number for standard drives (sda1 -> sda)
-	// For NVMe, strip pN suffix (nvme0n1p1 -> nvme0n1)
-	var blockDev string
-	if strings.HasPrefix(devBase, "nvme") {
-		// NVMe: find last 'p' followed by digits
-		if idx := strings.LastIndex(devBase, "p"); idx > 0 {
-			blockDev = devBase[:idx]
-		} else {
-			blockDev = devBase
-		}
-	} else if strings.HasPrefix(devBase, "sd") || strings.HasPrefix(devBase, "hd") || strings.HasPrefix(devBase, "vd") {
-		// SCSI/SATA/VirtIO: strip trailing digits
-		blockDev = strings.TrimRight(devBase, "0123456789")
-	} else if strings.HasPrefix(devBase, "md") {
-		// mdadm array — can't determine rotational from md device easily.
-		// On Unraid, md devices back the array. Try to read it anyway.
-		blockDev = devBase
-	} else {
-		blockDev = devBase
-	}
-
-	// Read the rotational flag
-	rotPath := fmt.Sprintf("/sys/block/%s/queue/rotational", blockDev)
-	data, err := os.ReadFile(rotPath)
-	if err != nil {
-		return DiskTypeUnknown
-	}
-
-	val := strings.TrimSpace(string(data))
-	switch val {
-	case "0":
-		return DiskTypeSSD
-	case "1":
-		return DiskTypeHDD
-	default:
-		return DiskTypeUnknown
-	}
+	return "", false
 }
 
 // ResolveDisk determines which Unraid disk a path belongs to.

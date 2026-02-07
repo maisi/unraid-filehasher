@@ -255,9 +255,54 @@ counts tuned to the disk type (1 worker for HDDs, 4 for SSDs).`,
 					Status:       "ok",
 				}
 
-				if err := database.UpsertFileTx(tx, record); err != nil {
-					atomic.AddInt64(&totalErrors, 1)
-					fmt.Fprintf(os.Stderr, "error storing %s: %v\n", result.Path, err)
+				// Safe move detection (helps with rebalancing):
+				// If this looks like a new path, try to find an older record with the same basename+size.
+				// If the old path is gone and the SHA matches, re-key the DB entry to the new path.
+				if lookupMap != nil {
+					if _, ok := lookupMap[result.Path]; !ok {
+						base := filepath.Base(result.Path)
+						cands, err := database.FindMoveCandidates(base, result.Size, 20)
+						if err == nil {
+							for _, cand := range cands {
+								if cand.Path == result.Path {
+									continue
+								}
+								// Only treat as moved if the old path is actually gone
+								_, statErr := os.Stat(cand.Path)
+								if statErr == nil {
+									continue
+								}
+								if !os.IsNotExist(statErr) {
+									continue
+								}
+
+								if cand.SHA256 == result.SHA256 {
+									if err := database.MovePathTx(tx, cand.Path, result.Path, result.Disk, result.Size, result.Mtime); err != nil {
+										atomic.AddInt64(&totalErrors, 1)
+										fmt.Fprintf(os.Stderr, "error moving record %s -> %s: %v\n", cand.Path, result.Path, err)
+									} else {
+										// Re-keyed successfully; skip normal upsert
+										record = nil
+									}
+									break
+								}
+
+								// Likely moved-but-changed: basename+size match, old path missing, but SHA differs.
+								// Flag the new path as corrupted and log a loud warning.
+								fmt.Fprintf(os.Stderr, "warning: possible move corruption: %s -> %s (size=%d, oldSHA=%s..., newSHA=%s...)\n",
+									cand.Path, result.Path, result.Size, cand.SHA256[:12], result.SHA256[:12])
+								record.Status = "corrupted"
+								break
+							}
+						}
+					}
+				}
+				// If record was re-keyed, do not upsert a duplicate.
+				if record != nil {
+					if err := database.UpsertFileTx(tx, record); err != nil {
+						atomic.AddInt64(&totalErrors, 1)
+						fmt.Fprintf(os.Stderr, "error storing %s: %v\n", result.Path, err)
+					}
 				}
 
 				batchCount++

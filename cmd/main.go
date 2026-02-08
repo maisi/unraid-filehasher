@@ -49,6 +49,29 @@ func main() {
 		Version: version,
 	}
 
+	// Add version to the top of help output
+	rootCmd.SetHelpTemplate(`filehasher {{.Version}}
+
+{{.Long}}
+
+Usage:
+  {{.UseLine}}{{if .HasAvailableSubCommands}}
+
+Available Commands:{{range .Commands}}{{if (or .IsAvailableCommand (eq .Name "help"))}}
+  {{rpad .Name .NamePadding }} {{.Short}}{{end}}{{end}}{{end}}{{if .HasAvailableLocalFlags}}
+
+Flags:
+{{.LocalFlags.FlagUsages | trimTrailingWhitespaces}}{{end}}{{if .HasAvailableInheritedFlags}}
+
+Global Flags:
+{{.InheritedFlags.FlagUsages | trimTrailingWhitespaces}}{{end}}{{if .HasHelpSubCommands}}
+
+Additional help topics:{{range .Commands}}{{if .IsAdditionalHelpTopicCommand}}
+  {{rpad .CommandPath .CommandPathPadding}} {{.Short}}{{end}}{{end}}{{end}}{{if .HasAvailableSubCommands}}
+
+Use "{{.CommandPath}} [command] --help" for more information about a command.{{end}}
+`)
+
 	rootCmd.PersistentFlags().StringVar(&dbPath, "db", defaultDBPath(), "path to SQLite database")
 	rootCmd.PersistentFlags().BoolVar(&jsonOut, "json", false, "output results as JSON")
 	rootCmd.PersistentFlags().StringSliceVarP(&excludes, "exclude", "e", nil, "regex patterns to exclude (can be repeated)")

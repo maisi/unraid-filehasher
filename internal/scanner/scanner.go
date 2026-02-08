@@ -155,7 +155,7 @@ func diskTypeFromBlockDevice(dev string) DiskType {
 		return DiskTypeUnknown
 	}
 
-	// If this is a partition (sda1, nvme0n1p1, etc.), try to map to the parent disk.
+	// If this is a partition (sda1, nvme0n1p1, md1p1, etc.), try to map to the parent disk.
 	parent := parentBlockDevice(dev)
 	if parent == "" {
 		parent = dev
@@ -164,6 +164,14 @@ func diskTypeFromBlockDevice(dev string) DiskType {
 	// If this is a stacked device (md/dm), inspect its slaves.
 	if t := diskTypeFromSlaves(parent); t != DiskTypeUnknown {
 		return t
+	}
+
+	// Unraid-specific: md devices sometimes have no slaves and report rotational=1 even if
+	// the underlying disk is SSD. Try to map mdXpY -> sdX by parsing /proc/mdstat.
+	if strings.HasPrefix(parent, "md") {
+		if under, ok := unraidUnderlyingBlockDevice(parent); ok {
+			return diskTypeFromBlockDevice(under)
+		}
 	}
 
 	// Fall back to rotational flag.
@@ -328,6 +336,67 @@ func diskTypeFromZpool(pool string) DiskType {
 		return DiskTypeSSD
 	}
 	return DiskTypeUnknown
+}
+
+// unraidUnderlyingBlockDevice maps Unraid md devices (e.g. md4p1) to the real
+// underlying block device (e.g. sda) by parsing /proc/mdstat.
+//
+// On Unraid, /proc/mdstat is not the standard mdraid status output; it contains
+// key/value lines like:
+//
+//	diskName.4=md4p1
+//	rdevName.4=sda
+func unraidUnderlyingBlockDevice(mdDev string) (string, bool) {
+	mdDev = strings.TrimSpace(mdDev)
+	if mdDev == "" {
+		return "", false
+	}
+
+	data, err := os.ReadFile("/proc/mdstat")
+	if err != nil {
+		return "", false
+	}
+
+	lines := strings.Split(string(data), "\n")
+	diskName := map[string]string{}
+	rdevName := map[string]string{}
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if !strings.Contains(line, "=") {
+			continue
+		}
+		parts := strings.SplitN(line, "=", 2)
+		key := strings.TrimSpace(parts[0])
+		val := strings.TrimSpace(parts[1])
+
+		if strings.HasPrefix(key, "diskName.") {
+			idx := strings.TrimPrefix(key, "diskName.")
+			diskName[idx] = val
+			continue
+		}
+		if strings.HasPrefix(key, "rdevName.") {
+			idx := strings.TrimPrefix(key, "rdevName.")
+			rdevName[idx] = val
+			continue
+		}
+	}
+
+	for idx, dn := range diskName {
+		if dn == mdDev {
+			if rv, ok := rdevName[idx]; ok {
+				rv = strings.TrimSpace(rv)
+				if rv != "" {
+					return rv, true
+				}
+			}
+		}
+	}
+
+	return "", false
 }
 
 func readRotationalSysfs(dev string) (string, bool) {

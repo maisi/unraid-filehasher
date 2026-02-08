@@ -195,7 +195,8 @@ func diskTypeFromSlaves(dev string) DiskType {
 	allSSD := true
 
 	for _, e := range entries {
-		if !e.IsDir() {
+		// Entries in slaves are symlinks to block devices
+		if e.Type() == 0 {
 			continue
 		}
 		seen++

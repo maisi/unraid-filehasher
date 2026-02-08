@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -65,6 +66,9 @@ func main() {
 func scanCmd() *cobra.Command {
 	var autoDetect bool
 	var fullScan bool
+	var diskTypeOverride string
+	var excludeSimple []string
+	var excludeAppdata bool
 
 	cmd := &cobra.Command{
 		Use:   "scan [paths...]",
@@ -82,6 +86,21 @@ counts tuned to the disk type (1 worker for HDDs, 4 for SSDs).`,
 			// Determine scan targets
 			var disks []scanner.DiskInfo
 
+			// Optional disk type override (useful when /sys detection is wrong or unavailable)
+			var overrideType *scanner.DiskType
+			switch strings.ToLower(strings.TrimSpace(diskTypeOverride)) {
+			case "", "auto":
+				// no override
+			case "hdd":
+				dt := scanner.DiskTypeHDD
+				overrideType = &dt
+			case "ssd":
+				dt := scanner.DiskTypeSSD
+				overrideType = &dt
+			default:
+				return fmt.Errorf("invalid --disk-type %q (expected auto|hdd|ssd)", diskTypeOverride)
+			}
+
 			if autoDetect {
 				detected, err := scanner.DetectUnraidDisks()
 				if err != nil {
@@ -91,6 +110,11 @@ counts tuned to the disk type (1 worker for HDDs, 4 for SSDs).`,
 					return fmt.Errorf("no Unraid disks detected under /mnt/")
 				}
 				disks = detected
+				if overrideType != nil {
+					for i := range disks {
+						disks[i].Type = *overrideType
+					}
+				}
 				for _, d := range disks {
 					fmt.Printf("Detected: %s (%s, %s, %d workers)\n",
 						d.Name, d.Path, d.Type, d.Type.DefaultWorkers())
@@ -105,10 +129,14 @@ counts tuned to the disk type (1 worker for HDDs, 4 for SSDs).`,
 						return fmt.Errorf("resolve path %s: %w", p, err)
 					}
 					name := scanner.ResolveDisk(absPath, absPath)
+					dt := scanner.DiskTypeUnknown
+					if overrideType != nil {
+						dt = *overrideType
+					}
 					disks = append(disks, scanner.DiskInfo{
 						Name: name,
 						Path: absPath,
-						Type: scanner.DiskTypeUnknown,
+						Type: dt,
 					})
 				}
 			}
@@ -132,8 +160,23 @@ counts tuned to the disk type (1 worker for HDDs, 4 for SSDs).`,
 				}
 			}
 
+			// Build exclude patterns
+			excludePatterns := append([]string{}, excludes...)
+			for _, p := range excludeSimple {
+				p = strings.TrimSpace(p)
+				if p == "" {
+					continue
+				}
+				// Substring match via regex-quoted pattern
+				excludePatterns = append(excludePatterns, regexp.QuoteMeta(p))
+			}
+			if excludeAppdata {
+				// Covers /mnt/cache/appdata, /mnt/user/appdata, nested .../appdata/... etc.
+				excludePatterns = append(excludePatterns, `(^|/)(appdata)(/|$)`)
+			}
+
 			// Create scanner
-			sc, err := scanner.New(excludes)
+			sc, err := scanner.New(excludePatterns)
 			if err != nil {
 				return err
 			}
@@ -382,6 +425,9 @@ counts tuned to the disk type (1 worker for HDDs, 4 for SSDs).`,
 
 	cmd.Flags().BoolVar(&autoDetect, "auto", false, "auto-detect Unraid array disks and cache")
 	cmd.Flags().BoolVar(&fullScan, "full", false, "force re-hash all files (skip incremental comparison)")
+	cmd.Flags().StringVar(&diskTypeOverride, "disk-type", "auto", "force disk type for scan targets: auto|hdd|ssd")
+	cmd.Flags().StringArrayVar(&excludeSimple, "exclude-simple", nil, "simple exclude (substring match on full path); repeatable")
+	cmd.Flags().BoolVar(&excludeAppdata, "exclude-appdata", false, "exclude Unraid appdata folders (recommended for large/docker-heavy systems)")
 	return cmd
 }
 

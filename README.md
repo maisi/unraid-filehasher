@@ -135,6 +135,9 @@ Disk type is auto-detected via `/sys/block/<dev>/queue/rotational`.
 | `--auto` | Auto-detect Unraid disks (`/mnt/disk*`, `/mnt/cache*`) |
 | `--full` | Force re-hash all files (disable incremental mode) |
 | `-e, --exclude PATTERN` | Regex patterns to exclude (repeatable) |
+| `--exclude-simple TEXT` | Simple exclude (substring match on full path; repeatable) |
+| `--exclude-appdata` | Exclude Unraid `appdata` folders (useful to skip noisy docker data) |
+| `--disk-type auto|hdd|ssd` | Force disk type (overrides /sys rotational detection) |
 | `--db PATH` | Database path (default: auto-detected) |
 | `--json` | JSON output |
 
@@ -173,6 +176,8 @@ Launch the web dashboard.
 |------|-------------|
 | `--db PATH` | SQLite database path |
 | `-e, --exclude PATTERN` | Regex exclude patterns (repeatable) |
+| `--exclude-simple TEXT` | Simple exclude (substring match on full path; repeatable) |
+| `--exclude-appdata` | Exclude Unraid `appdata` folders |
 | `--json` | JSON output for all commands |
 | `-v, --version` | Print version |
 

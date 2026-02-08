@@ -195,10 +195,9 @@ func diskTypeFromSlaves(dev string) DiskType {
 	allSSD := true
 
 	for _, e := range entries {
-		// Entries in slaves are symlinks to block devices
-		if e.Type() == 0 {
-			continue
-		}
+		// Entries in /sys/class/block/<dev>/slaves are typically symlinks, but on sysfs
+		// DirEntry.Type() may be TypeUnknown (0). Don't try to filter based on Type();
+		// just use the name and attempt rotational detection.
 		seen++
 		slave := e.Name()
 		// slave might itself be a partition; normalize

@@ -161,6 +161,13 @@ func diskTypeFromBlockDevice(dev string) DiskType {
 }
 
 func parentBlockDevice(dev string) string {
+	// md1p1 -> md1 (md driver partitions are named mdXpY)
+	if strings.HasPrefix(dev, "md") {
+		if idx := strings.LastIndex(dev, "p"); idx > 0 {
+			return dev[:idx]
+		}
+		return dev
+	}
 	// nvme0n1p1 -> nvme0n1
 	if strings.HasPrefix(dev, "nvme") {
 		if idx := strings.LastIndex(dev, "p"); idx > 0 {

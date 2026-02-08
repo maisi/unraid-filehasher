@@ -51,24 +51,34 @@ func New(database *db.DB, workers int, quick bool) *Verifier {
 }
 
 // VerifyAll verifies all tracked files and returns a summary.
-func (v *Verifier) VerifyAll(resultCb func(VerifyResult)) (*Summary, error) {
+func (v *Verifier) VerifyAll(resultCb func(VerifyResult), progressCb func(done, total int)) (*Summary, error) {
 	files, err := v.db.GetAllFiles()
 	if err != nil {
 		return nil, fmt.Errorf("get files: %w", err)
 	}
-	return v.verifyFiles(files, resultCb)
+	return v.verifyFiles(files, resultCb, progressCb)
 }
 
 // VerifyDisk verifies all tracked files on a specific disk.
-func (v *Verifier) VerifyDisk(disk string, resultCb func(VerifyResult)) (*Summary, error) {
+func (v *Verifier) VerifyDisk(disk string, resultCb func(VerifyResult), progressCb func(done, total int)) (*Summary, error) {
 	files, err := v.db.GetFilesByDisk(disk)
 	if err != nil {
 		return nil, fmt.Errorf("get files for disk %s: %w", disk, err)
 	}
-	return v.verifyFiles(files, resultCb)
+	return v.verifyFiles(files, resultCb, progressCb)
 }
 
-func (v *Verifier) verifyFiles(files []*db.FileRecord, resultCb func(VerifyResult)) (*Summary, error) {
+func (v *Verifier) verifyFiles(files []*db.FileRecord, resultCb func(VerifyResult), progressCb func(done, total int)) (*Summary, error) {
+	total := len(files)
+	var done atomic.Int64
+	updateProgress := func(delta int64) {
+		if progressCb == nil {
+			return
+		}
+		n := done.Add(delta)
+		progressCb(int(n), total)
+	}
+
 	start := time.Now()
 	summary := &Summary{}
 
@@ -104,14 +114,17 @@ func (v *Verifier) verifyFiles(files []*db.FileRecord, resultCb func(VerifyResul
 					missingMu.Lock()
 					missingPaths = append(missingPaths, f.Path)
 					missingMu.Unlock()
+					updateProgress(1)
 					continue
 				}
+				updateProgress(1)
 				continue
 			}
 
 			// In quick mode, skip files whose mtime and size haven't changed
 			if v.quick && stat.ModTime().Unix() == f.Mtime && stat.Size() == f.Size {
 				skippedCount.Add(1)
+				updateProgress(1)
 				continue
 			}
 
@@ -129,6 +142,7 @@ func (v *Verifier) verifyFiles(files []*db.FileRecord, resultCb func(VerifyResul
 	// Collect results
 	for result := range output {
 		summary.TotalChecked++
+		updateProgress(1)
 
 		stored := storedMap[result.Path]
 		if stored == nil {
@@ -177,6 +191,7 @@ func (v *Verifier) verifyFiles(files []*db.FileRecord, resultCb func(VerifyResul
 	for _, path := range missingPaths {
 		summary.TotalChecked++
 		summary.Missing++
+		// already counted as done in feeder
 		if err := v.db.UpdateStatusTx(tx, path, "missing"); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: update status for %s: %v\n", path, err)
 			summary.Errors++

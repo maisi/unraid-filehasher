@@ -17,7 +17,10 @@ import (
 	"github.com/maisi/unraid-filehasher/internal/scanner"
 	"github.com/maisi/unraid-filehasher/internal/verifier"
 	"github.com/maisi/unraid-filehasher/internal/web"
+	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
+	"github.com/vbauerster/mpb/v8"
+	"github.com/vbauerster/mpb/v8/decor"
 )
 
 var (
@@ -227,6 +230,36 @@ counts tuned to the disk type (1 worker for HDDs, 4 for SSDs).`,
 			var skipped int64
 			var totalProcessed int64
 			var totalErrors int64
+			var eligibleBytes int64
+			var eligibleFiles int64
+
+			// Progress bars (TTY only, disabled for --json)
+			useProgress := !jsonOut && isatty.IsTerminal(os.Stderr.Fd())
+			var p *mpb.Progress
+			var walkBar, hashBar *mpb.Bar
+			if useProgress {
+				p = mpb.New(mpb.WithOutput(os.Stderr), mpb.WithWidth(64))
+				walkBar = p.AddSpinner(0,
+					mpb.PrependDecorators(
+						decor.Name("Walk ", decor.WC{W: 6, C: decor.DindentRight}),
+						decor.CountersNoUnit("%d files", decor.WC{W: 14, C: decor.DindentRight}),
+					),
+					mpb.AppendDecorators(
+						decor.Elapsed(decor.ET_STYLE_GO),
+					),
+				)
+				hashBar = p.AddBar(0,
+					mpb.PrependDecorators(
+						decor.Name("Hash ", decor.WC{W: 6, C: decor.DindentRight}),
+						decor.CountersKibiByte("% .1f / % .1f", decor.WC{W: 18, C: decor.DindentRight}),
+						decor.AverageSpeed(decor.SizeB1024(0), "% .1f", decor.WC{W: 12, C: decor.DindentRight}),
+					),
+					mpb.AppendDecorators(
+						decor.Percentage(decor.WC{W: 6}),
+						decor.AverageETA(decor.ET_STYLE_GO, decor.WC{W: 12}),
+					),
+				)
+			}
 
 			// Launch per-disk pipelines
 			var pipelineWg sync.WaitGroup
@@ -269,6 +302,10 @@ counts tuned to the disk type (1 worker for HDDs, 4 for SSDs).`,
 					}()
 
 					for fi := range scanned {
+						if useProgress {
+							walkBar.Increment()
+						}
+
 						// Incremental check: skip if file hasn't changed since last scan
 						if lookupMap != nil {
 							if existing, ok := lookupMap[fi.Path]; ok {
@@ -277,6 +314,12 @@ counts tuned to the disk type (1 worker for HDDs, 4 for SSDs).`,
 									continue
 								}
 							}
+						}
+
+						atomic.AddInt64(&eligibleFiles, 1)
+						newTotalBytes := atomic.AddInt64(&eligibleBytes, fi.Size)
+						if useProgress {
+							hashBar.SetTotal(newTotalBytes, false)
 						}
 						diskInput <- fi
 					}
@@ -302,6 +345,9 @@ counts tuned to the disk type (1 worker for HDDs, 4 for SSDs).`,
 			for result := range results {
 				atomic.AddInt64(&totalProcessed, 1)
 				processed := atomic.LoadInt64(&totalProcessed)
+				if useProgress {
+					hashBar.IncrBy(int(result.Size))
+				}
 
 				if result.Err != nil {
 					atomic.AddInt64(&totalErrors, 1)
@@ -383,12 +429,7 @@ counts tuned to the disk type (1 worker for HDDs, 4 for SSDs).`,
 					batchCount = 0
 				}
 
-				// Progress output
-				if !jsonOut && processed%100 == 0 {
-					elapsed := time.Since(start)
-					rate := float64(processed) / elapsed.Seconds()
-					fmt.Printf("\r  Processed: %d files (%.0f files/sec)", processed, rate)
-				}
+				_ = processed
 			}
 
 			// Commit remaining
@@ -398,10 +439,19 @@ counts tuned to the disk type (1 worker for HDDs, 4 for SSDs).`,
 				}
 			}
 
+			if useProgress {
+				walkBar.SetTotal(walkBar.Current(), true)
+				hashBar.SetTotal(hashBar.Current(), true)
+				p.Wait()
+				fmt.Fprintln(os.Stderr)
+			}
+
 			elapsed := time.Since(start)
 			finalProcessed := int(atomic.LoadInt64(&totalProcessed))
 			finalErrors := int(atomic.LoadInt64(&totalErrors))
 			finalSkipped := int(atomic.LoadInt64(&skipped))
+			finalEligibleFiles := int(atomic.LoadInt64(&eligibleFiles))
+			finalEligibleBytes := atomic.LoadInt64(&eligibleBytes)
 
 			// Update scan history
 			if scanID > 0 {
@@ -414,6 +464,8 @@ counts tuned to the disk type (1 worker for HDDs, 4 for SSDs).`,
 				out := map[string]interface{}{
 					"files_processed": finalProcessed,
 					"files_skipped":   finalSkipped,
+					"eligible_files":  finalEligibleFiles,
+					"eligible_bytes":  finalEligibleBytes,
 					"errors":          finalErrors,
 					"duration":        elapsed.String(),
 					"full_scan":       fullScan,
@@ -428,6 +480,8 @@ counts tuned to the disk type (1 worker for HDDs, 4 for SSDs).`,
 			fmt.Printf("  Files hashed:    %d\n", finalProcessed)
 			fmt.Printf("  Files skipped:   %d (unchanged)\n", finalSkipped)
 			fmt.Printf("  Total files:     %d\n", finalProcessed+finalSkipped)
+			fmt.Printf("  Eligible files:  %d\n", finalEligibleFiles)
+			fmt.Printf("  Eligible bytes:  %s\n", format.Size(finalEligibleBytes))
 			fmt.Printf("  Errors:          %d\n", finalErrors)
 			fmt.Printf("  Duration:        %s\n", elapsed.Round(time.Millisecond))
 			fmt.Printf("  Database:        %s\n", dbPath)
@@ -497,16 +551,47 @@ func verifyCmd() *cobra.Command {
 				}
 			}
 
+			// Progress bar (TTY only, disabled for --json)
+			useProgress := !jsonOut && isatty.IsTerminal(os.Stderr.Fd())
+			var p *mpb.Progress
+			var bar *mpb.Bar
+			if useProgress {
+				p = mpb.New(mpb.WithOutput(os.Stderr), mpb.WithWidth(64))
+				bar = p.AddBar(0,
+					mpb.PrependDecorators(
+						decor.Name("Verify ", decor.WC{W: 8, C: decor.DindentRight}),
+						decor.CountersNoUnit("%d / %d", decor.WC{W: 18, C: decor.DindentRight}),
+					),
+					mpb.AppendDecorators(
+						decor.Percentage(decor.WC{W: 6}),
+						decor.AverageETA(decor.ET_STYLE_GO, decor.WC{W: 12}),
+					),
+				)
+			}
+
+			progressCb := func(done, total int) {
+				if !useProgress {
+					return
+				}
+				bar.SetTotal(int64(total), false)
+				bar.SetCurrent(int64(done))
+			}
+
 			var summary *verifier.Summary
 			if disk != "" {
 				fmt.Printf("Verifying files on disk: %s\n", disk)
-				summary, err = v.VerifyDisk(disk, resultCb)
+				summary, err = v.VerifyDisk(disk, resultCb, progressCb)
 			} else {
 				fmt.Printf("Verifying all tracked files...\n")
-				summary, err = v.VerifyAll(resultCb)
+				summary, err = v.VerifyAll(resultCb, progressCb)
 			}
 			if err != nil {
 				return fmt.Errorf("verify: %w", err)
+			}
+			if useProgress {
+				bar.SetTotal(bar.Current(), true)
+				p.Wait()
+				fmt.Fprintln(os.Stderr)
 			}
 
 			if scanID > 0 {

@@ -62,7 +62,7 @@ func TestVerifyAllOK(t *testing.T) {
 	var results []VerifyResult
 	summary, err := v.VerifyAll(func(r VerifyResult) {
 		results = append(results, r)
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("VerifyAll: %v", err)
 	}
@@ -114,7 +114,7 @@ func TestVerifyCorrupted(t *testing.T) {
 	var results []VerifyResult
 	summary, err := v.VerifyAll(func(r VerifyResult) {
 		results = append(results, r)
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("VerifyAll: %v", err)
 	}
@@ -151,7 +151,7 @@ func TestVerifyMissing(t *testing.T) {
 	var results []VerifyResult
 	summary, err := v.VerifyAll(func(r VerifyResult) {
 		results = append(results, r)
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("VerifyAll: %v", err)
 	}
@@ -192,7 +192,7 @@ func TestVerifyQuickModeSkip(t *testing.T) {
 	// Verify with quick=true — should skip since mtime/size unchanged
 	v := New(database, 1, true)
 
-	summary, err := v.VerifyAll(func(r VerifyResult) {})
+	summary, err := v.VerifyAll(func(r VerifyResult) {}, nil)
 	if err != nil {
 		t.Fatalf("VerifyAll: %v", err)
 	}
@@ -232,7 +232,7 @@ func TestVerifyDisk(t *testing.T) {
 
 	// Verify only disk1 — should only see 1 file, and it should be OK
 	v := New(database, 1, false)
-	summary, err := v.VerifyDisk("disk1", func(r VerifyResult) {})
+	summary, err := v.VerifyDisk("disk1", func(r VerifyResult) {}, nil)
 	if err != nil {
 		t.Fatalf("VerifyDisk: %v", err)
 	}

@@ -171,10 +171,16 @@ func diskTypeFromBlockDevice(dev string) DiskType {
 }
 
 func parentBlockDevice(dev string) string {
-	// md1p1 -> md1 (md driver partitions are named mdXpY)
+	// md1p1 -> md1 (md driver partitions are named mdXpY) BUT on some Unraid setups
+	// only the partition device exists in sysfs (md1p1) and the parent md1 does not.
+	// In that case, keep md1p1 to allow reading queue/rotational.
 	if strings.HasPrefix(dev, "md") {
 		if idx := strings.LastIndex(dev, "p"); idx > 0 {
-			return dev[:idx]
+			candidate := dev[:idx]
+			if _, err := os.Stat(filepath.Join("/sys/class/block", candidate)); err == nil {
+				return candidate
+			}
+			return dev
 		}
 		return dev
 	}

@@ -354,6 +354,13 @@ counts tuned to the disk type (1 worker for HDDs, 4 for SSDs).`,
 							list = append(list, fi)
 						}
 
+						// Walk done for this disk
+						if useProgress {
+							if bars, ok := diskProgress[disk.Name]; ok {
+								bars.walk.SetTotal(bars.walk.Current(), true)
+							}
+						}
+
 						// Set total bytes once, then hash sequentially.
 						if useProgress {
 							if bars, ok := diskProgress[disk.Name]; ok {
@@ -400,6 +407,13 @@ counts tuned to the disk type (1 worker for HDDs, 4 for SSDs).`,
 							}
 						}
 						diskInput <- fi
+					}
+
+					// Walk done for this disk
+					if useProgress {
+						if bars, ok := diskProgress[disk.Name]; ok {
+							bars.walk.SetTotal(bars.walk.Current(), true)
+						}
 					}
 				}()
 			}

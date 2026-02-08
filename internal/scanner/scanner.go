@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -126,10 +127,19 @@ func detectDiskType(mountPath string) DiskType {
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
 		fields := strings.Fields(sc.Text())
-		if len(fields) < 2 || fields[1] != mountPath {
+		if len(fields) < 3 || fields[1] != mountPath {
 			continue
 		}
-		devBase := filepath.Base(fields[0]) // e.g. "sda1", "md1", "dm-0"
+
+		src := fields[0]    // e.g. /dev/md1p1, /dev/sda1, cache (zfs pool)
+		fstype := fields[2] // xfs, zfs, btrfs, ...
+
+		// ZFS: mount source is the pool name, not a block device
+		if fstype == "zfs" && !strings.HasPrefix(src, "/dev/") {
+			return diskTypeFromZpool(src)
+		}
+
+		devBase := filepath.Base(src) // e.g. "sda1", "md1p1", "dm-0"
 		return diskTypeFromBlockDevice(devBase)
 	}
 
@@ -245,6 +255,70 @@ func diskTypeFromRotational(dev string) DiskType {
 		return DiskTypeHDD
 	}
 	if rot == "0" {
+		return DiskTypeSSD
+	}
+	return DiskTypeUnknown
+}
+
+// diskTypeFromZpool tries to infer HDD/SSD from underlying vdevs.
+// On Unraid, zfs mounts show the pool name as mount source (e.g. "cache").
+func diskTypeFromZpool(pool string) DiskType {
+	pool = strings.TrimSpace(pool)
+	if pool == "" {
+		return DiskTypeUnknown
+	}
+
+	// zpool status -P prints full paths to devices
+	out, err := exec.Command("zpool", "status", "-P", pool).CombinedOutput()
+	if err != nil {
+		return DiskTypeUnknown
+	}
+
+	lines := strings.Split(string(out), "\n")
+	seen := 0
+	anyHDD := false
+	allSSD := true
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// Tokenize; vdev path is usually the first token on the line (after indentation)
+		parts := strings.Fields(line)
+		if len(parts) == 0 {
+			continue
+		}
+		devPath := parts[0]
+		if !strings.HasPrefix(devPath, "/dev/") {
+			continue
+		}
+		devBase := filepath.Base(devPath)
+		parent := parentBlockDevice(devBase)
+		if parent == "" {
+			parent = devBase
+		}
+		t := diskTypeFromRotational(parent)
+		switch t {
+		case DiskTypeHDD:
+			anyHDD = true
+			allSSD = false
+			seen++
+		case DiskTypeSSD:
+			seen++
+		default:
+			allSSD = false
+			seen++
+		}
+	}
+
+	if seen == 0 {
+		return DiskTypeUnknown
+	}
+	if anyHDD {
+		return DiskTypeHDD
+	}
+	if allSSD {
 		return DiskTypeSSD
 	}
 	return DiskTypeUnknown

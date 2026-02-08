@@ -95,6 +95,7 @@ func scanCmd() *cobra.Command {
 	var diskTypeOverride string
 	var excludeSimple []string
 	var excludeAppdata bool
+	var hddTwoPhase bool
 
 	cmd := &cobra.Command{
 		Use:   "scan [paths...]",
@@ -109,6 +110,10 @@ every file.
 When using --auto, each disk gets its own hashing pipeline with worker
 counts tuned to the disk type (1 worker for HDDs, 4 for SSDs).`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if hddTwoPhase && !jsonOut {
+				fmt.Println("HDD mode: two-phase scan enabled (walk first, then hash)")
+			}
+
 			// Determine scan targets
 			var disks []scanner.DiskInfo
 
@@ -317,6 +322,53 @@ counts tuned to the disk type (1 worker for HDDs, 4 for SSDs).`,
 						}
 					}()
 
+					// HDD two-phase: collect eligible files first, then hash.
+					if hddTwoPhase && disk.Type == scanner.DiskTypeHDD {
+						var list []hasher.FileInfo
+						for fi := range scanned {
+							if useProgress {
+								if bars, ok := diskProgress[disk.Name]; ok {
+									bars.walk.Increment()
+								}
+							}
+
+							// Incremental check: skip if file hasn't changed since last scan
+							if lookupMap != nil {
+								if existing, ok := lookupMap[fi.Path]; ok {
+									if existing.Size == fi.Size && existing.Mtime == fi.Mtime {
+										atomic.AddInt64(&skipped, 1)
+										continue
+									}
+								}
+							}
+
+							atomic.AddInt64(&eligibleFiles, 1)
+							atomic.AddInt64(&eligibleBytes, fi.Size)
+							if bf := eligibleFilesByDisk[disk.Name]; bf != nil {
+								bf.Add(1)
+							}
+							if bb := eligibleBytesByDisk[disk.Name]; bb != nil {
+								bb.Add(fi.Size)
+							}
+
+							list = append(list, fi)
+						}
+
+						// Set total bytes once, then hash sequentially.
+						if useProgress {
+							if bars, ok := diskProgress[disk.Name]; ok {
+								if bb := eligibleBytesByDisk[disk.Name]; bb != nil {
+									bars.hash.SetTotal(bb.Load(), false)
+								}
+							}
+						}
+						for _, fi := range list {
+							diskInput <- fi
+						}
+						return
+					}
+
+					// Default (SSD/cache): stream walk -> hash pipeline.
 					for fi := range scanned {
 						if useProgress {
 							if bars, ok := diskProgress[disk.Name]; ok {
@@ -470,6 +522,7 @@ counts tuned to the disk type (1 worker for HDDs, 4 for SSDs).`,
 			if useProgress {
 				for _, bars := range diskProgress {
 					bars.walk.SetTotal(bars.walk.Current(), true)
+					// If total wasn't set (e.g. SSD streaming), complete at current.
 					bars.hash.SetTotal(bars.hash.Current(), true)
 				}
 				p.Wait()
@@ -535,6 +588,7 @@ counts tuned to the disk type (1 worker for HDDs, 4 for SSDs).`,
 	cmd.Flags().StringVar(&diskTypeOverride, "disk-type", "auto", "force disk type for scan targets: auto|hdd|ssd")
 	cmd.Flags().StringArrayVar(&excludeSimple, "exclude-simple", nil, "simple exclude (substring match on full path); repeatable")
 	cmd.Flags().BoolVar(&excludeAppdata, "exclude-appdata", false, "exclude Unraid appdata folders (recommended for large/docker-heavy systems)")
+	cmd.Flags().BoolVar(&hddTwoPhase, "hdd-two-phase", true, "for HDDs: walk first, then hash (reduces seek thrashing; uses more RAM)")
 	return cmd
 }
 

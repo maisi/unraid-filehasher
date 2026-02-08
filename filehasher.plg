@@ -2,10 +2,10 @@
 <!DOCTYPE PLUGIN [
   <!ENTITY name      "filehasher">
   <!ENTITY author    "filehasher">
-  <!ENTITY version   "2026.02.06">
+  <!ENTITY version   "dev">
   <!ENTITY gitURL    "https://github.com/maisi/unraid-filehasher">
   <!ENTITY pluginURL "&gitURL;/releases/latest/download/filehasher.plg">
-  <!ENTITY pkgURL    "&gitURL;/releases/download/v&version;/filehasher-linux-amd64.tar.gz">
+  <!ENTITY pkgURL    "&gitURL;/releases/latest/download/filehasher-linux-amd64.tar.gz">
 ]>
 
 <PLUGIN  name="&name;" author="&author;" version="&version;" pluginURL="&pluginURL;" min="6.12.0">

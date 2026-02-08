@@ -40,10 +40,6 @@ jobs:
       - name: Create release tarball
         run: tar czf build/filehasher-linux-amd64.tar.gz -C build filehasher
 
-      - name: Stamp version in plugin file
-        run: |
-          sed -i 's/<!ENTITY version   ".*">/<!ENTITY version   "${{ steps.version.outputs.version }}">/' filehasher.plg
-
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:

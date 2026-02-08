@@ -232,33 +232,49 @@ counts tuned to the disk type (1 worker for HDDs, 4 for SSDs).`,
 			var totalErrors int64
 			var eligibleBytes int64
 			var eligibleFiles int64
+			eligibleBytesByDisk := map[string]*atomic.Int64{}
+			eligibleFilesByDisk := map[string]*atomic.Int64{}
+			for _, d := range disks {
+				var b atomic.Int64
+				var f atomic.Int64
+				eligibleBytesByDisk[d.Name] = &b
+				eligibleFilesByDisk[d.Name] = &f
+			}
 
 			// Progress bars (TTY only, disabled for --json)
 			useProgress := !jsonOut && isatty.IsTerminal(os.Stderr.Fd())
 			var p *mpb.Progress
-			var walkBar, hashBar *mpb.Bar
+			type diskBars struct {
+				walk *mpb.Bar
+				hash *mpb.Bar
+			}
+			diskProgress := map[string]diskBars{}
 			if useProgress {
 				p = mpb.New(mpb.WithOutput(os.Stderr), mpb.WithWidth(64))
-				walkBar = p.AddSpinner(0,
-					mpb.PrependDecorators(
-						decor.Name("Walk ", decor.WC{W: 6, C: decor.DindentRight}),
-						decor.CountersNoUnit("%d files", decor.WC{W: 14, C: decor.DindentRight}),
-					),
-					mpb.AppendDecorators(
-						decor.Elapsed(decor.ET_STYLE_GO),
-					),
-				)
-				hashBar = p.AddBar(0,
-					mpb.PrependDecorators(
-						decor.Name("Hash ", decor.WC{W: 6, C: decor.DindentRight}),
-						decor.CountersKibiByte("% .1f / % .1f", decor.WC{W: 18, C: decor.DindentRight}),
-						decor.AverageSpeed(decor.SizeB1024(0), "% .1f", decor.WC{W: 12, C: decor.DindentRight}),
-					),
-					mpb.AppendDecorators(
-						decor.Percentage(decor.WC{W: 6}),
-						decor.AverageETA(decor.ET_STYLE_GO, decor.WC{W: 12}),
-					),
-				)
+				for _, d := range disks {
+					name := d.Name
+					w := p.AddSpinner(0,
+						mpb.PrependDecorators(
+							decor.Name(fmt.Sprintf("%s walk ", name), decor.WC{W: 16, C: decor.DindentRight}),
+							decor.CountersNoUnit("%d files", decor.WC{W: 14, C: decor.DindentRight}),
+						),
+						mpb.AppendDecorators(
+							decor.Elapsed(decor.ET_STYLE_GO),
+						),
+					)
+					h := p.AddBar(0,
+						mpb.PrependDecorators(
+							decor.Name(fmt.Sprintf("%s hash ", name), decor.WC{W: 16, C: decor.DindentRight}),
+							decor.CountersKibiByte("% .1f / % .1f", decor.WC{W: 18, C: decor.DindentRight}),
+							decor.AverageSpeed(decor.SizeB1024(0), "% .1f", decor.WC{W: 12, C: decor.DindentRight}),
+						),
+						mpb.AppendDecorators(
+							decor.Percentage(decor.WC{W: 6}),
+							decor.AverageETA(decor.ET_STYLE_GO, decor.WC{W: 12}),
+						),
+					)
+					diskProgress[name] = diskBars{walk: w, hash: h}
+				}
 			}
 
 			// Launch per-disk pipelines
@@ -303,7 +319,9 @@ counts tuned to the disk type (1 worker for HDDs, 4 for SSDs).`,
 
 					for fi := range scanned {
 						if useProgress {
-							walkBar.Increment()
+							if bars, ok := diskProgress[disk.Name]; ok {
+								bars.walk.Increment()
+							}
 						}
 
 						// Incremental check: skip if file hasn't changed since last scan
@@ -317,9 +335,17 @@ counts tuned to the disk type (1 worker for HDDs, 4 for SSDs).`,
 						}
 
 						atomic.AddInt64(&eligibleFiles, 1)
-						newTotalBytes := atomic.AddInt64(&eligibleBytes, fi.Size)
-						if useProgress {
-							hashBar.SetTotal(newTotalBytes, false)
+						atomic.AddInt64(&eligibleBytes, fi.Size)
+						if bf := eligibleFilesByDisk[disk.Name]; bf != nil {
+							bf.Add(1)
+						}
+						if bb := eligibleBytesByDisk[disk.Name]; bb != nil {
+							newDiskTotal := bb.Add(fi.Size)
+							if useProgress {
+								if bars, ok := diskProgress[disk.Name]; ok {
+									bars.hash.SetTotal(newDiskTotal, false)
+								}
+							}
 						}
 						diskInput <- fi
 					}
@@ -346,7 +372,9 @@ counts tuned to the disk type (1 worker for HDDs, 4 for SSDs).`,
 				atomic.AddInt64(&totalProcessed, 1)
 				processed := atomic.LoadInt64(&totalProcessed)
 				if useProgress {
-					hashBar.IncrBy(int(result.Size))
+					if bars, ok := diskProgress[result.Disk]; ok {
+						bars.hash.IncrBy(int(result.Size))
+					}
 				}
 
 				if result.Err != nil {
@@ -440,8 +468,10 @@ counts tuned to the disk type (1 worker for HDDs, 4 for SSDs).`,
 			}
 
 			if useProgress {
-				walkBar.SetTotal(walkBar.Current(), true)
-				hashBar.SetTotal(hashBar.Current(), true)
+				for _, bars := range diskProgress {
+					bars.walk.SetTotal(bars.walk.Current(), true)
+					bars.hash.SetTotal(bars.hash.Current(), true)
+				}
 				p.Wait()
 				fmt.Fprintln(os.Stderr)
 			}

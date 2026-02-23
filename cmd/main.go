@@ -261,7 +261,7 @@ counts tuned to the disk type (1 worker for HDDs, 4 for SSDs).`,
 					w := p.AddSpinner(0,
 						mpb.PrependDecorators(
 							decor.Name(fmt.Sprintf("%s walk ", name), decor.WC{W: 16, C: decor.DindentRight}),
-							decor.CountersNoUnit("%d files", decor.WC{W: 14, C: decor.DindentRight}),
+							decor.CurrentNoUnit("%d files", decor.WC{W: 14, C: decor.DindentRight}),
 						),
 						mpb.AppendDecorators(
 							decor.Elapsed(decor.ET_STYLE_GO),
@@ -279,6 +279,23 @@ counts tuned to the disk type (1 worker for HDDs, 4 for SSDs).`,
 						),
 					)
 					diskProgress[name] = diskBars{walk: w, hash: h}
+				}
+			}
+
+			// Thread-safe log helper: writes through mpb when progress is active
+			// (so the cursor math stays correct) and also collects messages
+			// for a summary after progress bars finish.
+			var progressMsgsMu sync.Mutex
+			var progressMsgs []string
+			logProgress := func(format string, args ...interface{}) {
+				msg := fmt.Sprintf(format, args...)
+				progressMsgsMu.Lock()
+				progressMsgs = append(progressMsgs, msg)
+				progressMsgsMu.Unlock()
+				if useProgress {
+					fmt.Fprint(p, msg)
+				} else {
+					fmt.Fprint(os.Stderr, msg)
 				}
 			}
 
@@ -318,7 +335,7 @@ counts tuned to the disk type (1 worker for HDDs, 4 for SSDs).`,
 							scanErrMu.Lock()
 							scanErrors = append(scanErrors, fmt.Sprintf("%s: %v", disk.Name, err))
 							scanErrMu.Unlock()
-							fmt.Fprintf(os.Stderr, "error scanning %s: %v\n", disk.Path, err)
+							logProgress("error scanning %s: %v\n", disk.Path, err)
 						}
 					}()
 
@@ -445,7 +462,7 @@ counts tuned to the disk type (1 worker for HDDs, 4 for SSDs).`,
 
 				if result.Err != nil {
 					atomic.AddInt64(&totalErrors, 1)
-					fmt.Fprintf(os.Stderr, "error: %s: %v\n", result.Path, result.Err)
+					logProgress("error: %s: %v\n", result.Path, result.Err)
 					continue
 				}
 
@@ -485,7 +502,7 @@ counts tuned to the disk type (1 worker for HDDs, 4 for SSDs).`,
 								if cand.SHA256 == result.SHA256 {
 									if err := database.MovePathTx(tx, cand.Path, result.Path, result.Disk, result.Size, result.Mtime); err != nil {
 										atomic.AddInt64(&totalErrors, 1)
-										fmt.Fprintf(os.Stderr, "error moving record %s -> %s: %v\n", cand.Path, result.Path, err)
+										logProgress("error moving record %s -> %s: %v\n", cand.Path, result.Path, err)
 									} else {
 										// Re-keyed successfully; skip normal upsert
 										record = nil
@@ -495,7 +512,7 @@ counts tuned to the disk type (1 worker for HDDs, 4 for SSDs).`,
 
 								// Likely moved-but-changed: basename+size match, old path missing, but SHA differs.
 								// Flag the new path as corrupted and log a loud warning.
-								fmt.Fprintf(os.Stderr, "warning: possible move corruption: %s -> %s (size=%d, oldSHA=%s..., newSHA=%s...)\n",
+								logProgress("warning: possible move corruption: %s -> %s (size=%d, oldSHA=%s..., newSHA=%s...)\n",
 									cand.Path, result.Path, result.Size, cand.SHA256[:12], result.SHA256[:12])
 								record.Status = "corrupted"
 								break
@@ -507,7 +524,7 @@ counts tuned to the disk type (1 worker for HDDs, 4 for SSDs).`,
 				if record != nil {
 					if err := database.UpsertFileTx(tx, record); err != nil {
 						atomic.AddInt64(&totalErrors, 1)
-						fmt.Fprintf(os.Stderr, "error storing %s: %v\n", result.Path, err)
+						logProgress("error storing %s: %v\n", result.Path, err)
 					}
 				}
 
@@ -541,6 +558,15 @@ counts tuned to the disk type (1 worker for HDDs, 4 for SSDs).`,
 				}
 				p.Wait()
 				fmt.Fprintln(os.Stderr)
+			}
+
+			// Print collected warnings/errors summary
+			if len(progressMsgs) > 0 {
+				fmt.Fprintln(os.Stderr, "--- Warnings/Errors during scan ---")
+				for _, msg := range progressMsgs {
+					fmt.Fprint(os.Stderr, msg)
+				}
+				fmt.Fprintln(os.Stderr, "---")
 			}
 
 			elapsed := time.Since(start)

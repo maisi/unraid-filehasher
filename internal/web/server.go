@@ -216,6 +216,18 @@ var templateFuncMap = template.FuncMap{
 			return "status-unknown"
 		}
 	},
+	"unixTime": func(t *time.Time) int64 {
+		if t == nil {
+			return 0
+		}
+		return t.Unix()
+	},
+	"unixTimeVal": func(t time.Time) int64 {
+		if t.IsZero() {
+			return 0
+		}
+		return t.Unix()
+	},
 }
 
 // cachedTemplates holds parsed templates, keyed by content template name.

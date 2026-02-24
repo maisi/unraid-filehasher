@@ -106,7 +106,23 @@ var baseTemplate = `<!DOCTYPE html>
             font-weight: 600;
             text-transform: uppercase;
             font-size: 11px;
+            cursor: pointer;
+            user-select: none;
+            position: relative;
+            padding-right: 20px;
         }
+        th:hover { color: #c9d1d9; }
+        th::after {
+            content: "";
+            position: absolute;
+            right: 4px;
+            top: 50%;
+            transform: translateY(-50%);
+            font-size: 10px;
+            color: #484f58;
+        }
+        th.sort-asc::after { content: "\25B2"; color: #58a6ff; }
+        th.sort-desc::after { content: "\25BC"; color: #58a6ff; }
         tr:hover { background: #1c2128; }
         
         /* Status badges */
@@ -164,6 +180,44 @@ var baseTemplate = `<!DOCTYPE html>
     <div class="container">
         {{template "content" .}}
     </div>
+    <script>
+    document.querySelectorAll("table").forEach(function(table) {
+        var headers = table.querySelectorAll("thead th");
+        if (!headers.length) return;
+        headers.forEach(function(th, colIdx) {
+            th.addEventListener("click", function() {
+                var tbody = table.querySelector("tbody");
+                if (!tbody) return;
+                var rows = Array.from(tbody.querySelectorAll("tr"));
+                if (!rows.length) return;
+
+                var asc = !th.classList.contains("sort-asc");
+                headers.forEach(function(h) { h.classList.remove("sort-asc", "sort-desc"); });
+                th.classList.add(asc ? "sort-asc" : "sort-desc");
+
+                rows.sort(function(a, b) {
+                    var cellA = a.children[colIdx];
+                    var cellB = b.children[colIdx];
+                    if (!cellA || !cellB) return 0;
+
+                    var valA = cellA.getAttribute("data-sort-value");
+                    var valB = cellB.getAttribute("data-sort-value");
+                    if (valA === null) valA = cellA.textContent.trim();
+                    if (valB === null) valB = cellB.textContent.trim();
+
+                    var numA = parseFloat(valA);
+                    var numB = parseFloat(valB);
+                    if (!isNaN(numA) && !isNaN(numB) && String(numA) === valA && String(numB) === valB) {
+                        return asc ? numA - numB : numB - numA;
+                    }
+                    return asc ? valA.localeCompare(valB) : valB.localeCompare(valA);
+                });
+
+                rows.forEach(function(row) { tbody.appendChild(row); });
+            });
+        });
+    });
+    </script>
 </body>
 </html>`
 
@@ -219,10 +273,10 @@ var templates = map[string]string{
             <tr>
                 <td><a href="/disks?name={{.Disk}}" class="disk-link">{{.Disk}}</a></td>
                 <td class="text-right">{{.TotalFiles}}</td>
-                <td class="text-right">{{formatBytes .TotalSize}}</td>
+                <td class="text-right" data-sort-value="{{.TotalSize}}">{{formatBytes .TotalSize}}</td>
                 <td class="text-right {{if gt .CorruptedFiles 0}}status-corrupted{{end}}">{{.CorruptedFiles}}</td>
                 <td class="text-right {{if gt .MissingFiles 0}}status-missing{{end}}">{{.MissingFiles}}</td>
-                <td class="text-muted">{{formatTime .LastVerified}}</td>
+                <td class="text-muted" data-sort-value="{{unixTime .LastVerified}}">{{formatTime .LastVerified}}</td>
             </tr>
             {{end}}
         </tbody>
@@ -250,10 +304,10 @@ var templates = map[string]string{
             <tr>
                 <td><a href="/disks?name={{.Disk}}" class="disk-link">{{.Disk}}</a></td>
                 <td class="text-right">{{.TotalFiles}}</td>
-                <td class="text-right">{{formatBytes .TotalSize}}</td>
+                <td class="text-right" data-sort-value="{{.TotalSize}}">{{formatBytes .TotalSize}}</td>
                 <td class="text-right {{if gt .CorruptedFiles 0}}status-corrupted{{end}}">{{.CorruptedFiles}}</td>
                 <td class="text-right {{if gt .MissingFiles 0}}status-missing{{end}}">{{.MissingFiles}}</td>
-                <td class="text-muted">{{formatTime .LastVerified}}</td>
+                <td class="text-muted" data-sort-value="{{unixTime .LastVerified}}">{{formatTime .LastVerified}}</td>
             </tr>
             {{end}}
         </tbody>
@@ -279,9 +333,9 @@ var templates = map[string]string{
             <tr>
                 <td class="{{statusClass .Status}}">{{.Status}}</td>
                 <td class="path-cell mono">{{.Path}}</td>
-                <td class="text-right">{{formatBytes .Size}}</td>
+                <td class="text-right" data-sort-value="{{.Size}}">{{formatBytes .Size}}</td>
                 <td class="mono">{{truncHash .SHA256}}</td>
-                <td class="text-muted">{{formatTimeVal .LastVerified}}</td>
+                <td class="text-muted" data-sort-value="{{unixTimeVal .LastVerified}}">{{formatTimeVal .LastVerified}}</td>
             </tr>
             {{end}}
         </tbody>
@@ -310,9 +364,9 @@ var templates = map[string]string{
                 <td class="{{statusClass .Status}}">{{.Status}}</td>
                 <td><a href="/disks?name={{.Disk}}" class="disk-link">{{.Disk}}</a></td>
                 <td class="path-cell mono">{{.Path}}</td>
-                <td class="text-right">{{formatBytes .Size}}</td>
+                <td class="text-right" data-sort-value="{{.Size}}">{{formatBytes .Size}}</td>
                 <td class="mono">{{truncHash .SHA256}}</td>
-                <td class="text-muted">{{formatTimeVal .LastVerified}}</td>
+                <td class="text-muted" data-sort-value="{{unixTimeVal .LastVerified}}">{{formatTimeVal .LastVerified}}</td>
             </tr>
             {{end}}
         </tbody>
@@ -349,7 +403,7 @@ var templates = map[string]string{
                 <td class="{{statusClass .Status}}">{{.Status}}</td>
                 <td><a href="/disks?name={{.Disk}}" class="disk-link">{{.Disk}}</a></td>
                 <td class="path-cell mono">{{.Path}}</td>
-                <td class="text-right">{{formatBytes .Size}}</td>
+                <td class="text-right" data-sort-value="{{.Size}}">{{formatBytes .Size}}</td>
                 <td class="mono">{{truncHash .SHA256}}</td>
             </tr>
             {{end}}

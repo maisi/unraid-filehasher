@@ -211,6 +211,28 @@ func (db *DB) GetAllFiles() ([]*FileRecord, error) {
 	return scanFileRows(rows)
 }
 
+// GetAllFilesPaginated returns a page of file records with total count.
+func (db *DB) GetAllFilesPaginated(limit, offset int) ([]*FileRecord, int64, error) {
+	var total int64
+	if err := db.conn.QueryRow(`SELECT COUNT(*) FROM files`).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	rows, err := db.conn.Query(`
+		SELECT id, path, disk, size, mtime, sha256, first_seen, last_verified, status
+		FROM files
+		ORDER BY path
+		LIMIT ? OFFSET ?
+	`, limit, offset)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	files, err := scanFileRows(rows)
+	return files, total, err
+}
+
 // UpdateStatusTx updates the status and last_verified time within a transaction.
 func (db *DB) UpdateStatusTx(tx *sql.Tx, path, status string) error {
 	_, err := tx.Exec(`
@@ -420,10 +442,19 @@ func (db *DB) GetScanHistory(limit int) ([]map[string]interface{}, error) {
 			"files_processed": filesProcessed,
 			"errors":          errCount,
 			"status":          status,
+			"duration":        "",
 		}
 		if endedAtStr.Valid {
 			if t, err := parseTime(endedAtStr.String); err == nil {
 				entry["ended_at"] = t.Format("2006-01-02 15:04:05")
+				dur := t.Sub(startedAt)
+				if dur < time.Second {
+					entry["duration"] = dur.Round(time.Millisecond).String()
+				} else if dur < time.Minute {
+					entry["duration"] = dur.Round(time.Second).String()
+				} else {
+					entry["duration"] = dur.Round(time.Second).String()
+				}
 			}
 		}
 		history = append(history, entry)

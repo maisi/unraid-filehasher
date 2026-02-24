@@ -882,9 +882,11 @@ func serverCmd() *cobra.Command {
 			}
 			defer database.Close()
 
+			runner := web.NewRunner(database)
+
 			addr := fmt.Sprintf(":%d", port)
 			fmt.Printf("Starting filehasher dashboard at http://0.0.0.0%s\n", addr)
-			return web.Serve(database, addr)
+			return web.Serve(database, addr, version, runner)
 		},
 	}
 

@@ -46,6 +46,7 @@ func Serve(database *db.DB, addr string, version string, runner *Runner) error {
 	if runner != nil {
 		mux.HandleFunc("/api/scan", handleAPIScan(runner))
 		mux.HandleFunc("/api/verify", handleAPIVerify(runner))
+		mux.HandleFunc("/api/stop", handleAPIStop(runner))
 		mux.HandleFunc("/api/progress", handleAPIProgress(runner))
 	}
 
@@ -427,6 +428,23 @@ func handleAPIVerify(runner *Runner) http.HandlerFunc {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"status": "started"})
+	}
+}
+
+func handleAPIStop(runner *Runner) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if err := runner.Stop(); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "stopping"})
 	}
 }
 

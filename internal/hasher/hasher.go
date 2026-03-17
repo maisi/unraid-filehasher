@@ -1,6 +1,7 @@
 package hasher
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -102,6 +103,13 @@ func hashFileWithInfo(fi FileInfo) (*Result, error) {
 // The results channel is closed when all workers finish.
 // When FileInfo includes Size/Mtime (from a prior stat), the redundant stat is skipped.
 func (h *Hasher) HashFiles(files <-chan FileInfo, results chan<- Result) {
+	h.HashFilesContext(context.Background(), files, results)
+}
+
+// HashFilesContext hashes multiple files in parallel with cancellation support.
+// When the context is cancelled, workers finish their current file and stop.
+// The results channel is closed when all workers finish.
+func (h *Hasher) HashFilesContext(ctx context.Context, files <-chan FileInfo, results chan<- Result) {
 	var wg sync.WaitGroup
 
 	for i := 0; i < h.workers; i++ {
@@ -109,6 +117,13 @@ func (h *Hasher) HashFiles(files <-chan FileInfo, results chan<- Result) {
 		go func() {
 			defer wg.Done()
 			for fi := range files {
+				// Check for cancellation before starting a new file
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+
 				var result *Result
 				var err error
 				if fi.Size > 0 || fi.Mtime > 0 {

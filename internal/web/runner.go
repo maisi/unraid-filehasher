@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -24,15 +25,26 @@ const (
 	StateVerifying RunnerState = "verifying"
 )
 
+// DiskProgress holds progress information for a single disk.
+type DiskProgress struct {
+	Disk       string `json:"disk"`
+	Phase      string `json:"phase"`      // "walking", "hashing", "complete", "cancelled"
+	FilesFound int64  `json:"filesFound"` // files discovered during walk (that need hashing)
+	FilesDone  int64  `json:"filesDone"`  // files hashed/verified so far
+	BytesTotal int64  `json:"bytesTotal"` // total bytes to hash (accumulated during walk)
+	BytesDone  int64  `json:"bytesDone"`  // bytes hashed so far
+}
+
 // RunnerProgress holds current progress information.
 type RunnerProgress struct {
-	State   RunnerState `json:"state"`
-	Phase   string      `json:"phase"`   // e.g., "walking", "hashing", "verifying"
-	Done    int64       `json:"done"`    // files processed so far
-	Total   int64       `json:"total"`   // total files (0 if unknown)
-	Errors  int64       `json:"errors"`  // error count
-	Started time.Time   `json:"started"` // when current op started
-	Message string      `json:"message"` // latest status message
+	State   RunnerState    `json:"state"`
+	Phase   string         `json:"phase"`   // e.g., "walking", "hashing", "verifying", "complete", "cancelled", "error"
+	Done    int64          `json:"done"`    // files processed so far
+	Total   int64          `json:"total"`   // total files (0 if unknown)
+	Errors  int64          `json:"errors"`  // error count
+	Started time.Time      `json:"started"` // when current op started
+	Message string         `json:"message"` // latest status message
+	Disks   []DiskProgress `json:"disks"`   // per-disk progress (nil when idle with no history)
 }
 
 // Runner manages background scan and verify operations.
@@ -41,6 +53,7 @@ type Runner struct {
 
 	mu       sync.RWMutex
 	progress RunnerProgress
+	cancel   context.CancelFunc // cancel function for current operation
 
 	// SSE subscribers
 	subMu   sync.Mutex
@@ -114,6 +127,19 @@ func (r *Runner) notify(p RunnerProgress) {
 	}
 }
 
+// Stop cancels the currently running operation.
+func (r *Runner) Stop() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.progress.State == StateIdle {
+		return fmt.Errorf("no operation running")
+	}
+	if r.cancel != nil {
+		r.cancel()
+	}
+	return nil
+}
+
 // StartScan begins a background scan operation. Returns an error if already busy.
 func (r *Runner) StartScan() error {
 	r.mu.Lock()
@@ -121,6 +147,8 @@ func (r *Runner) StartScan() error {
 		r.mu.Unlock()
 		return fmt.Errorf("already running: %s", r.progress.State)
 	}
+	ctx, cancel := context.WithCancel(context.Background())
+	r.cancel = cancel
 	r.progress = RunnerProgress{
 		State:   StateScanning,
 		Phase:   "detecting disks",
@@ -129,7 +157,7 @@ func (r *Runner) StartScan() error {
 	r.mu.Unlock()
 	r.notify(r.Progress())
 
-	go r.runScan()
+	go r.runScan(ctx)
 	return nil
 }
 
@@ -140,6 +168,8 @@ func (r *Runner) StartVerify() error {
 		r.mu.Unlock()
 		return fmt.Errorf("already running: %s", r.progress.State)
 	}
+	ctx, cancel := context.WithCancel(context.Background())
+	r.cancel = cancel
 	r.progress = RunnerProgress{
 		State:   StateVerifying,
 		Phase:   "starting",
@@ -148,13 +178,30 @@ func (r *Runner) StartVerify() error {
 	r.mu.Unlock()
 	r.notify(r.Progress())
 
-	go r.runVerify()
+	go r.runVerify(ctx)
 	return nil
 }
 
-func (r *Runner) runScan() {
-	defer r.setProgress(RunnerProgress{State: StateIdle})
+// finishOperation sets the final progress state. Phase should be "complete", "cancelled", or "error".
+// The state is set to idle but phase/message/disks are preserved so the frontend can display them.
+func (r *Runner) finishOperation(phase string, done, total, errors int64, message string, disks []DiskProgress) {
+	r.mu.Lock()
+	r.cancel = nil
+	r.progress = RunnerProgress{
+		State:   StateIdle,
+		Phase:   phase,
+		Done:    done,
+		Total:   total,
+		Errors:  errors,
+		Message: message,
+		Disks:   disks,
+	}
+	snap := r.progress
+	r.mu.Unlock()
+	r.notify(snap)
+}
 
+func (r *Runner) runScan(ctx context.Context) {
 	// Detect Unraid disks
 	disks, err := scanner.DetectUnraidDisks()
 	if err != nil || len(disks) == 0 {
@@ -162,39 +209,51 @@ func (r *Runner) runScan() {
 		if err != nil {
 			msg = fmt.Sprintf("disk detection failed: %v", err)
 		}
-		r.updateProgress(func(p *RunnerProgress) {
-			p.Phase = "error"
-			p.Message = msg
-		})
+		r.finishOperation("error", 0, 0, 0, msg, nil)
 		return
 	}
 
-	r.updateProgress(func(p *RunnerProgress) {
-		names := make([]string, len(disks))
-		for i, d := range disks {
-			names[i] = d.Name
+	// Initialize per-disk progress
+	diskProgressMap := make(map[string]*DiskProgress, len(disks))
+	diskProgressList := make([]DiskProgress, len(disks))
+	for i, d := range disks {
+		diskProgressList[i] = DiskProgress{
+			Disk:  d.Name,
+			Phase: "walking",
 		}
+		diskProgressMap[d.Name] = &diskProgressList[i]
+	}
+
+	names := make([]string, len(disks))
+	for i, d := range disks {
+		names[i] = d.Name
+	}
+
+	r.updateProgress(func(p *RunnerProgress) {
 		p.Phase = "walking"
 		p.Message = fmt.Sprintf("Scanning %d disks: %s", len(disks), strings.Join(names, ", "))
+		p.Disks = cloneDiskProgress(diskProgressList)
 	})
+
+	// Check for cancellation
+	select {
+	case <-ctx.Done():
+		r.finishOperation("cancelled", 0, 0, 0, "Scan cancelled during disk detection", cloneDiskProgress(diskProgressList))
+		return
+	default:
+	}
 
 	// Load lookup map for incremental scan
 	lookupMap, err := r.db.LoadQuickLookupMap()
 	if err != nil {
-		r.updateProgress(func(p *RunnerProgress) {
-			p.Phase = "error"
-			p.Message = fmt.Sprintf("load lookup map: %v", err)
-		})
+		r.finishOperation("error", 0, 0, 0, fmt.Sprintf("load lookup map: %v", err), nil)
 		return
 	}
 
 	// Create scanner with no excludes (web scan uses defaults)
 	sc, err := scanner.New(nil)
 	if err != nil {
-		r.updateProgress(func(p *RunnerProgress) {
-			p.Phase = "error"
-			p.Message = fmt.Sprintf("create scanner: %v", err)
-		})
+		r.finishOperation("error", 0, 0, 0, fmt.Sprintf("create scanner: %v", err), nil)
 		return
 	}
 
@@ -229,16 +288,17 @@ func (r *Runner) runScan() {
 			}
 		}()
 
-		go h.HashFiles(diskInput, output)
+		go h.HashFilesContext(ctx, diskInput, output)
 
 		disk := d
+		dp := diskProgressMap[disk.Name]
 		go func() {
 			defer close(diskInput)
 
 			scanned := make(chan hasher.FileInfo, workers*4)
 			go func() {
 				defer close(scanned)
-				if err := sc.Walk(disk.Path, disk.Name, scanned); err != nil {
+				if err := sc.WalkContext(ctx, disk.Path, disk.Name, scanned); err != nil {
 					r.updateProgress(func(p *RunnerProgress) {
 						p.Message = fmt.Sprintf("error scanning %s: %v", disk.Path, err)
 					})
@@ -246,6 +306,13 @@ func (r *Runner) runScan() {
 			}()
 
 			for fi := range scanned {
+				// Check for cancellation
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+
 				// Incremental check
 				if lookupMap != nil {
 					if existing, ok := lookupMap[fi.Path]; ok {
@@ -255,8 +322,16 @@ func (r *Runner) runScan() {
 						}
 					}
 				}
+
+				// Track per-disk walk progress
+				atomic.AddInt64(&dp.FilesFound, 1)
+				atomic.AddInt64(&dp.BytesTotal, fi.Size)
+
 				diskInput <- fi
 			}
+
+			// Mark disk walk as complete, transition to hashing
+			dp.Phase = "hashing"
 		}()
 	}
 
@@ -272,10 +347,7 @@ func (r *Runner) runScan() {
 	// Process results
 	tx, txErr := r.db.BeginBatch()
 	if txErr != nil {
-		r.updateProgress(func(p *RunnerProgress) {
-			p.Phase = "error"
-			p.Message = fmt.Sprintf("begin transaction: %v", txErr)
-		})
+		r.finishOperation("error", 0, 0, 0, fmt.Sprintf("begin transaction: %v", txErr), nil)
 		return
 	}
 	defer func() { tx.Rollback() }()
@@ -283,12 +355,33 @@ func (r *Runner) runScan() {
 	batchSize := 1000
 	batchCount := 0
 
+	cancelled := false
 	for result := range results {
+		// Check for cancellation
+		select {
+		case <-ctx.Done():
+			cancelled = true
+			// Drain remaining results to unblock goroutines
+			for range results {
+			}
+			break
+		default:
+		}
+		if cancelled {
+			break
+		}
+
 		atomic.AddInt64(&totalProcessed, 1)
 
 		if result.Err != nil {
 			atomic.AddInt64(&totalErrors, 1)
 			continue
+		}
+
+		// Track per-disk hash progress
+		if dp, ok := diskProgressMap[result.Disk]; ok {
+			atomic.AddInt64(&dp.FilesDone, 1)
+			atomic.AddInt64(&dp.BytesDone, result.Size)
 		}
 
 		now := time.Now()
@@ -340,18 +433,14 @@ func (r *Runner) runScan() {
 		batchCount++
 		if batchCount >= batchSize {
 			if err := tx.Commit(); err != nil {
-				r.updateProgress(func(p *RunnerProgress) {
-					p.Phase = "error"
-					p.Message = fmt.Sprintf("commit batch: %v", err)
-				})
+				r.finishOperation("error", atomic.LoadInt64(&totalProcessed), 0, atomic.LoadInt64(&totalErrors),
+					fmt.Sprintf("commit batch: %v", err), cloneDiskProgress(diskProgressList))
 				return
 			}
 			tx, txErr = r.db.BeginBatch()
 			if txErr != nil {
-				r.updateProgress(func(p *RunnerProgress) {
-					p.Phase = "error"
-					p.Message = fmt.Sprintf("begin new batch: %v", txErr)
-				})
+				r.finishOperation("error", atomic.LoadInt64(&totalProcessed), 0, atomic.LoadInt64(&totalErrors),
+					fmt.Sprintf("begin new batch: %v", txErr), cloneDiskProgress(diskProgressList))
 				return
 			}
 			batchCount = 0
@@ -362,21 +451,57 @@ func (r *Runner) runScan() {
 		if processed%50 == 0 {
 			errors := atomic.LoadInt64(&totalErrors)
 			skip := atomic.LoadInt64(&skipped)
+
+			// Mark disks as complete if all their files are done
+			for i := range diskProgressList {
+				dp := &diskProgressList[i]
+				if dp.Phase == "hashing" && dp.FilesFound > 0 && dp.FilesDone >= dp.FilesFound {
+					dp.Phase = "complete"
+				}
+			}
+
 			r.updateProgress(func(p *RunnerProgress) {
 				p.Done = processed
 				p.Errors = errors
+				p.Disks = cloneDiskProgress(diskProgressList)
 				p.Message = fmt.Sprintf("Hashed %d files, skipped %d, %d errors", processed, skip, errors)
 			})
 		}
 	}
 
+	// Handle cancellation
+	if cancelled {
+		// Commit what we have so far
+		if batchCount > 0 {
+			tx.Commit()
+		}
+		finalProcessed := atomic.LoadInt64(&totalProcessed)
+		finalErrors := atomic.LoadInt64(&totalErrors)
+		finalSkipped := atomic.LoadInt64(&skipped)
+		elapsed := time.Since(r.Progress().Started)
+
+		if scanID > 0 {
+			r.db.CompleteScanHistory(scanID, int(finalProcessed), int(finalErrors))
+		}
+
+		for i := range diskProgressList {
+			if diskProgressList[i].Phase != "complete" {
+				diskProgressList[i].Phase = "cancelled"
+			}
+		}
+
+		r.finishOperation("cancelled", finalProcessed, 0, finalErrors,
+			fmt.Sprintf("Scan cancelled: %d hashed, %d skipped, %d errors in %s",
+				finalProcessed, finalSkipped, finalErrors, elapsed.Round(time.Second)),
+			cloneDiskProgress(diskProgressList))
+		return
+	}
+
 	// Commit remaining
 	if batchCount > 0 {
 		if err := tx.Commit(); err != nil {
-			r.updateProgress(func(p *RunnerProgress) {
-				p.Phase = "error"
-				p.Message = fmt.Sprintf("commit final batch: %v", err)
-			})
+			r.finishOperation("error", atomic.LoadInt64(&totalProcessed), 0, atomic.LoadInt64(&totalErrors),
+				fmt.Sprintf("commit final batch: %v", err), cloneDiskProgress(diskProgressList))
 			return
 		}
 	}
@@ -389,41 +514,105 @@ func (r *Runner) runScan() {
 		r.db.CompleteScanHistory(scanID, int(finalProcessed), int(finalErrors))
 	}
 
+	// Mark all disks as complete
+	for i := range diskProgressList {
+		diskProgressList[i].Phase = "complete"
+	}
+
 	elapsed := time.Since(r.Progress().Started)
-	r.updateProgress(func(p *RunnerProgress) {
-		p.Phase = "complete"
-		p.Done = finalProcessed
-		p.Errors = finalErrors
-		p.Message = fmt.Sprintf("Scan complete: %d hashed, %d skipped, %d errors in %s",
-			finalProcessed, finalSkipped, finalErrors, elapsed.Round(time.Second))
-	})
+	r.finishOperation("complete", finalProcessed, finalProcessed, finalErrors,
+		fmt.Sprintf("Scan complete: %d hashed, %d skipped, %d errors in %s",
+			finalProcessed, finalSkipped, finalErrors, elapsed.Round(time.Second)),
+		cloneDiskProgress(diskProgressList))
 }
 
-func (r *Runner) runVerify() {
-	defer r.setProgress(RunnerProgress{State: StateIdle})
-
+func (r *Runner) runVerify(ctx context.Context) {
 	scanID, _ := r.db.InsertScanHistory("verify", "")
 	v := verifier.New(r.db, 4, false)
+
+	// Load files to build per-disk progress
+	allFiles, err := r.db.GetAllFiles()
+	if err != nil {
+		r.finishOperation("error", 0, 0, 0, fmt.Sprintf("load files: %v", err), nil)
+		return
+	}
+
+	// Build per-disk counters
+	diskFileCounts := make(map[string]int64)
+	diskByteCounts := make(map[string]int64)
+	for _, f := range allFiles {
+		diskFileCounts[f.Disk]++
+		diskByteCounts[f.Disk] += f.Size
+	}
+
+	// Create disk progress list
+	diskProgressList := make([]DiskProgress, 0, len(diskFileCounts))
+	diskProgressMap := make(map[string]*DiskProgress, len(diskFileCounts))
+	for disk, count := range diskFileCounts {
+		diskProgressList = append(diskProgressList, DiskProgress{
+			Disk:       disk,
+			Phase:      "verifying",
+			FilesFound: count,
+			BytesTotal: diskByteCounts[disk],
+		})
+		diskProgressMap[disk] = &diskProgressList[len(diskProgressList)-1]
+	}
+
+	total := int64(len(allFiles))
+
+	r.updateProgress(func(p *RunnerProgress) {
+		p.Phase = "verifying"
+		p.Total = total
+		p.Disks = cloneDiskProgress(diskProgressList)
+		p.Message = fmt.Sprintf("Verifying %d files across %d disks", total, len(diskFileCounts))
+	})
 
 	resultCb := func(vr verifier.VerifyResult) {
 		// No-op for web — progress is tracked via progressCb
 	}
 
+	var verifyDone int64
 	progressCb := func(done, total int) {
-		r.updateProgress(func(p *RunnerProgress) {
-			p.Phase = "verifying"
-			p.Done = int64(done)
-			p.Total = int64(total)
-			p.Message = fmt.Sprintf("Verified %d / %d files", done, total)
-		})
+		atomic.StoreInt64(&verifyDone, int64(done))
+
+		// Update periodically (every 50 files)
+		if done%50 == 0 || done == total {
+			r.updateProgress(func(p *RunnerProgress) {
+				p.Phase = "verifying"
+				p.Done = int64(done)
+				p.Total = int64(total)
+				p.Disks = cloneDiskProgress(diskProgressList)
+				p.Message = fmt.Sprintf("Verified %d / %d files", done, total)
+			})
+		}
 	}
 
-	summary, err := v.VerifyAll(resultCb, progressCb)
+	summary, err := v.VerifyAllContext(ctx, resultCb, progressCb)
+
 	if err != nil {
-		r.updateProgress(func(p *RunnerProgress) {
-			p.Phase = "error"
-			p.Message = fmt.Sprintf("verify failed: %v", err)
-		})
+		// Check if it was a cancellation
+		if ctx.Err() != nil {
+			finalDone := atomic.LoadInt64(&verifyDone)
+			elapsed := time.Since(r.Progress().Started)
+
+			for i := range diskProgressList {
+				if diskProgressList[i].Phase != "complete" {
+					diskProgressList[i].Phase = "cancelled"
+				}
+			}
+
+			if scanID > 0 && summary != nil {
+				r.db.CompleteScanHistory(scanID, summary.TotalChecked, summary.Errors)
+			}
+
+			r.finishOperation("cancelled", finalDone, total, 0,
+				fmt.Sprintf("Verify cancelled: %d / %d checked in %s",
+					finalDone, total, elapsed.Round(time.Second)),
+				cloneDiskProgress(diskProgressList))
+			return
+		}
+
+		r.finishOperation("error", 0, 0, 0, fmt.Sprintf("verify failed: %v", err), nil)
 		return
 	}
 
@@ -431,13 +620,33 @@ func (r *Runner) runVerify() {
 		r.db.CompleteScanHistory(scanID, summary.TotalChecked, summary.Errors)
 	}
 
-	r.updateProgress(func(p *RunnerProgress) {
-		p.Phase = "complete"
-		p.Done = int64(summary.TotalChecked)
-		p.Total = int64(summary.TotalChecked)
-		p.Errors = int64(summary.Errors)
-		p.Message = fmt.Sprintf("Verify complete: %d checked, %d OK, %d corrupted, %d missing in %s",
+	// Mark all disks as complete
+	for i := range diskProgressList {
+		diskProgressList[i].Phase = "complete"
+	}
+
+	r.finishOperation("complete", int64(summary.TotalChecked), int64(summary.TotalChecked), int64(summary.Errors),
+		fmt.Sprintf("Verify complete: %d checked, %d OK, %d corrupted, %d missing in %s",
 			summary.TotalChecked, summary.OK, summary.Corrupted, summary.Missing,
-			summary.Duration.Round(time.Second))
-	})
+			summary.Duration.Round(time.Second)),
+		cloneDiskProgress(diskProgressList))
+}
+
+// cloneDiskProgress creates a snapshot of the disk progress slice for safe concurrent access.
+func cloneDiskProgress(src []DiskProgress) []DiskProgress {
+	if src == nil {
+		return nil
+	}
+	dst := make([]DiskProgress, len(src))
+	for i := range src {
+		dst[i] = DiskProgress{
+			Disk:       src[i].Disk,
+			Phase:      src[i].Phase,
+			FilesFound: atomic.LoadInt64(&src[i].FilesFound),
+			FilesDone:  atomic.LoadInt64(&src[i].FilesDone),
+			BytesTotal: atomic.LoadInt64(&src[i].BytesTotal),
+			BytesDone:  atomic.LoadInt64(&src[i].BytesDone),
+		}
+	}
+	return dst
 }

@@ -1,6 +1,7 @@
 package verifier
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"sync"
@@ -52,11 +53,16 @@ func New(database *db.DB, workers int, quick bool) *Verifier {
 
 // VerifyAll verifies all tracked files and returns a summary.
 func (v *Verifier) VerifyAll(resultCb func(VerifyResult), progressCb func(done, total int)) (*Summary, error) {
+	return v.VerifyAllContext(context.Background(), resultCb, progressCb)
+}
+
+// VerifyAllContext verifies all tracked files with cancellation support.
+func (v *Verifier) VerifyAllContext(ctx context.Context, resultCb func(VerifyResult), progressCb func(done, total int)) (*Summary, error) {
 	files, err := v.db.GetAllFiles()
 	if err != nil {
 		return nil, fmt.Errorf("get files: %w", err)
 	}
-	return v.verifyFiles(files, resultCb, progressCb)
+	return v.verifyFiles(ctx, files, resultCb, progressCb)
 }
 
 // VerifyDisk verifies all tracked files on a specific disk.
@@ -65,10 +71,10 @@ func (v *Verifier) VerifyDisk(disk string, resultCb func(VerifyResult), progress
 	if err != nil {
 		return nil, fmt.Errorf("get files for disk %s: %w", disk, err)
 	}
-	return v.verifyFiles(files, resultCb, progressCb)
+	return v.verifyFiles(context.Background(), files, resultCb, progressCb)
 }
 
-func (v *Verifier) verifyFiles(files []*db.FileRecord, resultCb func(VerifyResult), progressCb func(done, total int)) (*Summary, error) {
+func (v *Verifier) verifyFiles(ctx context.Context, files []*db.FileRecord, resultCb func(VerifyResult), progressCb func(done, total int)) (*Summary, error) {
 	total := len(files)
 	var done atomic.Int64
 	updateProgress := func(delta int64) {
@@ -95,7 +101,7 @@ func (v *Verifier) verifyFiles(files []*db.FileRecord, resultCb func(VerifyResul
 	}
 
 	// Start the hasher in a goroutine
-	go h.HashFiles(input, output)
+	go h.HashFilesContext(ctx, input, output)
 
 	// Track files the feeder determined are missing (avoids double stat later)
 	var missingPaths []string
@@ -106,6 +112,12 @@ func (v *Verifier) verifyFiles(files []*db.FileRecord, resultCb func(VerifyResul
 	go func() {
 		defer close(input)
 		for _, f := range files {
+			// Check for cancellation
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
 			// Check if file still exists
 			stat, err := os.Stat(f.Path)
 			if err != nil {
@@ -141,6 +153,15 @@ func (v *Verifier) verifyFiles(files []*db.FileRecord, resultCb func(VerifyResul
 
 	// Collect results
 	for result := range output {
+		// Check for cancellation
+		select {
+		case <-ctx.Done():
+			tx.Rollback()
+			summary.Duration = time.Since(start)
+			return summary, ctx.Err()
+		default:
+		}
+
 		summary.TotalChecked++
 		updateProgress(1)
 

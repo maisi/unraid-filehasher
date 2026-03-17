@@ -2,6 +2,7 @@ package scanner
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io/fs"
 	"os"
@@ -454,7 +455,20 @@ func ResolveDisk(filePath, scanRoot string) string {
 // It skips files matching the exclude patterns.
 // Each file includes its stat info (size, mtime) so callers don't need to re-stat.
 func (s *Scanner) Walk(root string, disk string, files chan<- hasher.FileInfo) error {
+	return s.WalkContext(context.Background(), root, disk, files)
+}
+
+// WalkContext walks a directory tree with cancellation support.
+// It stops walking and returns when the context is cancelled.
+func (s *Scanner) WalkContext(ctx context.Context, root string, disk string, files chan<- hasher.FileInfo) error {
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		// Check for cancellation
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
 		if err != nil {
 			// Log but continue on permission errors, etc.
 			fmt.Fprintf(os.Stderr, "warning: %s: %v\n", path, err)
@@ -507,6 +521,11 @@ func (s *Scanner) Walk(root string, disk string, files chan<- hasher.FileInfo) e
 		}
 		return nil
 	})
+
+	// Don't treat context cancellation as an error
+	if err == context.Canceled || err == context.DeadlineExceeded {
+		return nil
+	}
 
 	return err
 }

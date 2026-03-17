@@ -182,11 +182,15 @@ var baseTemplate = `<!DOCTYPE html>
             border-radius: 6px;
             text-decoration: none;
             font-size: 13px;
+            cursor: pointer;
         }
         .btn:hover { background: #30363d; }
         .btn-primary { background: #238636; border-color: #238636; color: #fff; }
         .btn-primary:hover { background: #2ea043; }
         .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+        .btn-danger { background: #da3633; border-color: #da3633; color: #fff; }
+        .btn-danger:hover { background: #f85149; }
+        .btn-danger:disabled { opacity: 0.5; cursor: not-allowed; }
 
         /* Progress bar */
         .progress-bar-container {
@@ -201,6 +205,120 @@ var baseTemplate = `<!DOCTYPE html>
             background: #58a6ff;
             border-radius: 6px;
             transition: width 0.3s ease;
+        }
+        .progress-bar.bar-success { background: #3fb950; }
+        .progress-bar.bar-warning { background: #d29922; }
+        .progress-bar.bar-danger { background: #f85149; }
+
+        /* Result banner */
+        .result-banner {
+            padding: 12px 16px;
+            border-radius: 6px;
+            font-size: 14px;
+            font-weight: 500;
+            margin-bottom: 12px;
+        }
+        .result-banner.banner-success {
+            background: rgba(63, 185, 80, 0.15);
+            border: 1px solid rgba(63, 185, 80, 0.4);
+            color: #3fb950;
+        }
+        .result-banner.banner-cancelled {
+            background: rgba(210, 153, 34, 0.15);
+            border: 1px solid rgba(210, 153, 34, 0.4);
+            color: #d29922;
+        }
+        .result-banner.banner-error {
+            background: rgba(248, 81, 73, 0.15);
+            border: 1px solid rgba(248, 81, 73, 0.4);
+            color: #f85149;
+        }
+
+        /* Per-disk progress */
+        .disk-progress-list {
+            margin-top: 12px;
+        }
+        .disk-progress-row {
+            display: grid;
+            grid-template-columns: 80px 1fr 180px;
+            align-items: center;
+            gap: 12px;
+            padding: 6px 0;
+            border-bottom: 1px solid #21262d;
+            font-size: 13px;
+        }
+        .disk-progress-row:last-child { border-bottom: none; }
+        .disk-progress-name {
+            font-weight: 600;
+            color: #58a6ff;
+        }
+        .disk-progress-bar-wrap {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .disk-progress-bar-wrap .progress-bar-container {
+            flex: 1;
+        }
+        .disk-progress-pct {
+            font-size: 12px;
+            font-weight: 600;
+            color: #e6edf3;
+            min-width: 36px;
+            text-align: right;
+        }
+        .disk-progress-stats {
+            font-size: 12px;
+            color: #8b949e;
+            text-align: right;
+            white-space: nowrap;
+        }
+        .disk-progress-phase {
+            display: inline-block;
+            font-size: 11px;
+            padding: 1px 6px;
+            border-radius: 4px;
+            text-transform: uppercase;
+            font-weight: 600;
+        }
+        .disk-progress-phase.phase-walking {
+            background: rgba(88, 166, 255, 0.15);
+            color: #58a6ff;
+        }
+        .disk-progress-phase.phase-hashing,
+        .disk-progress-phase.phase-verifying {
+            background: rgba(210, 153, 34, 0.15);
+            color: #d29922;
+        }
+        .disk-progress-phase.phase-complete {
+            background: rgba(63, 185, 80, 0.15);
+            color: #3fb950;
+        }
+        .disk-progress-phase.phase-cancelled {
+            background: rgba(210, 153, 34, 0.15);
+            color: #d29922;
+        }
+
+        /* Elapsed time */
+        .progress-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 8px;
+        }
+        .progress-header-left {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        .elapsed-time {
+            font-size: 13px;
+            color: #8b949e;
+            font-family: "SFMono-Regular", Consolas, monospace;
+        }
+        .overall-speed {
+            font-size: 12px;
+            color: #8b949e;
         }
     </style>
 </head>
@@ -263,6 +381,30 @@ var baseTemplate = `<!DOCTYPE html>
     });
     </script>
     <script>
+    // --- Utility functions ---
+    function formatBytes(bytes) {
+        if (bytes === 0) return "0 B";
+        var units = ["B", "KB", "MB", "GB", "TB"];
+        var i = 0;
+        var v = bytes;
+        while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+        return v.toFixed(i === 0 ? 0 : 1) + " " + units[i];
+    }
+
+    function formatElapsed(seconds) {
+        var h = Math.floor(seconds / 3600);
+        var m = Math.floor((seconds % 3600) / 60);
+        var s = Math.floor(seconds % 60);
+        if (h > 0) return h + "h " + (m < 10 ? "0" : "") + m + "m " + (s < 10 ? "0" : "") + s + "s";
+        if (m > 0) return m + "m " + (s < 10 ? "0" : "") + s + "s";
+        return s + "s";
+    }
+
+    // --- State ---
+    var evtSource = null;
+    var elapsedTimer = null;
+    var opStartTime = null;
+
     function startOp(type) {
         var btn = document.getElementById("btn-" + type);
         if (btn) btn.disabled = true;
@@ -275,41 +417,196 @@ var baseTemplate = `<!DOCTYPE html>
             .catch(function(e) { alert("Error: " + e); if (btn) btn.disabled = false; });
     }
 
-    var evtSource = null;
+    function stopOp() {
+        var btn = document.getElementById("btn-stop");
+        if (btn) btn.disabled = true;
+        fetch("/api/stop", {method: "POST"})
+            .then(function(r) { return r.json(); })
+            .then(function(d) {
+                if (d.error) { alert(d.error); if (btn) btn.disabled = false; }
+            })
+            .catch(function(e) { alert("Error: " + e); if (btn) btn.disabled = false; });
+    }
+
+    function startElapsedTimer() {
+        stopElapsedTimer();
+        elapsedTimer = setInterval(function() {
+            if (!opStartTime) return;
+            var elapsed = (Date.now() - opStartTime) / 1000;
+            var el = document.getElementById("elapsed-time");
+            if (el) el.textContent = formatElapsed(elapsed);
+        }, 1000);
+    }
+
+    function stopElapsedTimer() {
+        if (elapsedTimer) { clearInterval(elapsedTimer); elapsedTimer = null; }
+    }
+
+    function renderDiskProgress(disks) {
+        var container = document.getElementById("disk-progress-list");
+        if (!container) return;
+        if (!disks || disks.length === 0) {
+            container.innerHTML = "";
+            return;
+        }
+
+        var html = "";
+        for (var i = 0; i < disks.length; i++) {
+            var d = disks[i];
+            var pct = 0;
+            if (d.bytesTotal > 0) {
+                pct = Math.round((d.bytesDone / d.bytesTotal) * 100);
+            } else if (d.filesFound > 0 && d.filesDone > 0) {
+                pct = Math.round((d.filesDone / d.filesFound) * 100);
+            } else if (d.phase === "walking" && d.filesFound > 0) {
+                pct = 0; // walking, no percentage yet
+            }
+            if (d.phase === "complete") pct = 100;
+
+            var barClass = "progress-bar";
+            if (d.phase === "complete") barClass += " bar-success";
+            else if (d.phase === "cancelled") barClass += " bar-warning";
+
+            var phaseClass = "disk-progress-phase phase-" + d.phase;
+
+            var statsText = "";
+            if (d.phase === "walking") {
+                statsText = d.filesFound + " files found (" + formatBytes(d.bytesTotal) + ")";
+            } else if (d.phase === "hashing" || d.phase === "verifying") {
+                statsText = d.filesDone + " / " + d.filesFound + " files (" + formatBytes(d.bytesDone) + " / " + formatBytes(d.bytesTotal) + ")";
+            } else if (d.phase === "complete") {
+                statsText = d.filesDone + " files (" + formatBytes(d.bytesDone) + ")";
+            } else if (d.phase === "cancelled") {
+                statsText = d.filesDone + " / " + d.filesFound + " files";
+            }
+
+            html += '<div class="disk-progress-row">';
+            html += '<div><span class="disk-progress-name">' + d.disk + '</span> <span class="' + phaseClass + '">' + d.phase + '</span></div>';
+            html += '<div class="disk-progress-bar-wrap">';
+            html += '<div class="progress-bar-container"><div class="' + barClass + '" style="width:' + pct + '%"></div></div>';
+            html += '<span class="disk-progress-pct">' + pct + '%</span>';
+            html += '</div>';
+            html += '<div class="disk-progress-stats">' + statsText + '</div>';
+            html += '</div>';
+        }
+        container.innerHTML = html;
+    }
+
     function connectSSE() {
         if (evtSource) evtSource.close();
         var section = document.getElementById("progress-section");
+        var banner = document.getElementById("result-banner");
         if (section) section.style.display = "block";
+        if (banner) banner.style.display = "none";
 
         evtSource = new EventSource("/api/progress");
         evtSource.onmessage = function(e) {
             var p = JSON.parse(e.data);
-            var stateEl = document.getElementById("progress-state");
-            var phaseEl = document.getElementById("progress-phase");
             var barEl = document.getElementById("progress-bar");
             var msgEl = document.getElementById("progress-message");
             var btnScan = document.getElementById("btn-scan");
             var btnVerify = document.getElementById("btn-verify");
+            var btnStop = document.getElementById("btn-stop");
+            var speedEl = document.getElementById("overall-speed");
 
-            if (stateEl) stateEl.textContent = p.state;
-            if (phaseEl) phaseEl.textContent = p.phase;
-            if (msgEl) msgEl.textContent = p.message;
-
-            var pct = 0;
-            if (p.total > 0) pct = Math.round((p.done / p.total) * 100);
-            else if (p.done > 0) pct = 50;
-            if (barEl) barEl.style.width = pct + "%";
-
-            if (p.state === "idle") {
-                if (btnScan) btnScan.disabled = false;
-                if (btnVerify) btnVerify.disabled = false;
-                if (p.phase === "complete" || p.message) {
-                    if (barEl) barEl.style.width = "100%";
+            if (p.state !== "idle") {
+                // Active operation
+                if (p.started) {
+                    opStartTime = new Date(p.started).getTime();
+                    startElapsedTimer();
                 }
-                if (evtSource) { evtSource.close(); evtSource = null; }
-            } else {
+
                 if (btnScan) btnScan.disabled = true;
                 if (btnVerify) btnVerify.disabled = true;
+                if (btnStop) { btnStop.style.display = "inline-block"; btnStop.disabled = false; }
+                if (section) section.style.display = "block";
+
+                // Overall progress bar
+                var pct = 0;
+                var totalBytes = 0;
+                var doneBytes = 0;
+                if (p.disks && p.disks.length > 0) {
+                    for (var i = 0; i < p.disks.length; i++) {
+                        totalBytes += p.disks[i].bytesTotal;
+                        doneBytes += p.disks[i].bytesDone;
+                    }
+                    if (totalBytes > 0) pct = Math.round((doneBytes / totalBytes) * 100);
+                    else if (p.total > 0) pct = Math.round((p.done / p.total) * 100);
+                    else if (p.done > 0) pct = 10; // walking phase, show minimal progress
+                } else if (p.total > 0) {
+                    pct = Math.round((p.done / p.total) * 100);
+                } else if (p.done > 0) {
+                    pct = 10;
+                }
+                if (barEl) barEl.style.width = pct + "%";
+                if (barEl) { barEl.className = "progress-bar"; }
+
+                // Speed calculation
+                if (speedEl && opStartTime && doneBytes > 0) {
+                    var elapsedSec = (Date.now() - opStartTime) / 1000;
+                    if (elapsedSec > 0) {
+                        var speed = doneBytes / elapsedSec;
+                        speedEl.textContent = formatBytes(speed) + "/s";
+                    }
+                } else if (speedEl) {
+                    speedEl.textContent = "";
+                }
+
+                if (msgEl) msgEl.textContent = p.message || "";
+
+                // Per-disk progress
+                renderDiskProgress(p.disks);
+
+            } else {
+                // Idle - operation finished (or was never running)
+                stopElapsedTimer();
+                if (btnScan) btnScan.disabled = false;
+                if (btnVerify) btnVerify.disabled = false;
+                if (btnStop) btnStop.style.display = "none";
+
+                if (p.phase === "complete" || p.phase === "cancelled" || p.phase === "error") {
+                    // Show result banner
+                    if (banner) {
+                        banner.style.display = "block";
+                        banner.className = "result-banner";
+                        if (p.phase === "complete") {
+                            banner.classList.add("banner-success");
+                            banner.textContent = p.message;
+                            if (barEl) { barEl.style.width = "100%"; barEl.className = "progress-bar bar-success"; }
+                        } else if (p.phase === "cancelled") {
+                            banner.classList.add("banner-cancelled");
+                            banner.textContent = p.message;
+                            if (barEl) { barEl.className = "progress-bar bar-warning"; }
+                        } else if (p.phase === "error") {
+                            banner.classList.add("banner-error");
+                            banner.textContent = p.message;
+                            if (barEl) { barEl.className = "progress-bar bar-danger"; }
+                        }
+                    }
+
+                    // Show final elapsed time
+                    if (opStartTime) {
+                        var finalElapsed = (Date.now() - opStartTime) / 1000;
+                        var el = document.getElementById("elapsed-time");
+                        if (el) el.textContent = formatElapsed(finalElapsed);
+                    }
+
+                    // Show final disk progress
+                    renderDiskProgress(p.disks);
+
+                    // Keep progress section visible to show the result
+                    if (section) section.style.display = "block";
+                    if (msgEl) msgEl.textContent = "";
+
+                    var speedEl2 = document.getElementById("overall-speed");
+                    if (speedEl2) speedEl2.textContent = "";
+                } else {
+                    // Truly idle with no completion info (initial page load, no operation ran)
+                    if (section) section.style.display = "none";
+                }
+
+                opStartTime = null;
+                if (evtSource) { evtSource.close(); evtSource = null; }
             }
         };
         evtSource.onerror = function() {
@@ -362,16 +659,22 @@ var templates = map[string]string{
     <div style="display:flex;gap:8px;margin-bottom:12px;">
         <button id="btn-scan" class="btn btn-primary" onclick="startOp('scan')">Start Scan</button>
         <button id="btn-verify" class="btn btn-primary" onclick="startOp('verify')">Start Verify</button>
+        <button id="btn-stop" class="btn btn-danger" onclick="stopOp()" style="display:none;">Stop</button>
     </div>
+    <div id="result-banner" class="result-banner" style="display:none;"></div>
     <div id="progress-section" style="display:none;">
-        <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px;">
-            <span id="progress-state" class="text-muted"></span>
-            <span id="progress-phase" class="text-muted"></span>
+        <div class="progress-header">
+            <div class="progress-header-left">
+                <span id="progress-state" class="text-muted"></span>
+                <span id="overall-speed" class="overall-speed"></span>
+            </div>
+            <span id="elapsed-time" class="elapsed-time"></span>
         </div>
         <div class="progress-bar-container">
             <div id="progress-bar" class="progress-bar" style="width:0%"></div>
         </div>
         <p id="progress-message" class="text-muted" style="margin-top:8px;font-size:13px;"></p>
+        <div id="disk-progress-list" class="disk-progress-list"></div>
     </div>
 </div>
 
@@ -662,8 +965,8 @@ var templates = map[string]string{
             </label>
             <select name="mode"
                 style="width:100%;padding:8px 12px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#c9d1d9;font-size:14px;">
-                <option value="full" {{if eq .Config.Mode "full"}}selected{{end}}>Full — re-hash every file</option>
-                <option value="quick" {{if eq .Config.Mode "quick"}}selected{{end}}>Quick — skip unchanged files</option>
+                <option value="full" {{if eq .Config.Mode "full"}}selected{{end}}>Full -- re-hash every file</option>
+                <option value="quick" {{if eq .Config.Mode "quick"}}selected{{end}}>Quick -- skip unchanged files</option>
             </select>
         </div>
         <button type="submit" class="btn btn-primary" style="padding:8px 20px;">Save Settings</button>

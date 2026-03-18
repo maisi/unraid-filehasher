@@ -50,6 +50,9 @@ func Serve(database *db.DB, addr string, version string, runner *Runner) error {
 		mux.HandleFunc("/api/progress", handleAPIProgress(runner))
 	}
 
+	// Config endpoint (read-only, for JS options panel)
+	mux.HandleFunc("/api/config", handleAPIConfig())
+
 	return http.ListenAndServe(addr, mux)
 }
 
@@ -260,21 +263,62 @@ func handleHistory(database *db.DB) http.HandlerFunc {
 	}
 }
 
-const cronCfgPath = "/boot/config/filehasher/cron.cfg"
+const cfgPath = "/boot/config/filehasher/cron.cfg"
 
-type cronConfig struct {
+// appConfig holds all persistent settings (cron, scan, verify, thermal).
+type appConfig struct {
+	// Scheduled verification
 	Enabled  bool
 	Schedule string
 	Mode     string // "full" or "quick"
+
+	// Scan defaults
+	ScanExcludes       string // newline-separated regex patterns
+	ScanExcludeAppdata bool
+	ScanFull           bool
+	ScanHddTwoPhase    bool
+	ScanDiskType       string // "auto", "hdd", "ssd"
+
+	// Verify defaults
+	VerifyWorkers int
+	VerifyQuick   bool
+
+	// Thermal protection
+	ThermalEnabled   bool
+	ThermalPollSecs  int
+	ThermalHddPause  int
+	ThermalHddResume int
+	ThermalSsdPause  int
+	ThermalSsdResume int
 }
 
-func readCronConfig() cronConfig {
-	cfg := cronConfig{
-		Schedule: "0 3 * * 0",
-		Mode:     "full",
+func defaultAppConfig() appConfig {
+	return appConfig{
+		Schedule:         "0 3 * * 0",
+		Mode:             "full",
+		ScanHddTwoPhase:  true,
+		ScanDiskType:     "auto",
+		VerifyWorkers:    4,
+		ThermalEnabled:   true,
+		ThermalPollSecs:  60,
+		ThermalHddPause:  55,
+		ThermalHddResume: 45,
+		ThermalSsdPause:  70,
+		ThermalSsdResume: 60,
 	}
+}
 
-	f, err := os.Open(cronCfgPath)
+func boolToYesNo(b bool) string {
+	if b {
+		return "yes"
+	}
+	return "no"
+}
+
+func readAppConfig() appConfig {
+	cfg := defaultAppConfig()
+
+	f, err := os.Open(cfgPath)
 	if err != nil {
 		return cfg
 	}
@@ -293,35 +337,107 @@ func readCronConfig() cronConfig {
 		key := strings.TrimSpace(parts[0])
 		val := strings.TrimSpace(parts[1])
 		switch key {
+		// Cron / scheduled verification
 		case "ENABLED":
 			cfg.Enabled = val == "yes"
 		case "SCHEDULE":
 			cfg.Schedule = val
 		case "MODE":
 			cfg.Mode = val
+
+		// Scan defaults
+		case "SCAN_EXCLUDES":
+			// Stored with literal \n as line separator
+			cfg.ScanExcludes = strings.ReplaceAll(val, `\n`, "\n")
+		case "SCAN_EXCLUDE_APPDATA":
+			cfg.ScanExcludeAppdata = val == "yes"
+		case "SCAN_FULL":
+			cfg.ScanFull = val == "yes"
+		case "SCAN_HDD_TWO_PHASE":
+			cfg.ScanHddTwoPhase = val == "yes"
+		case "SCAN_DISK_TYPE":
+			cfg.ScanDiskType = val
+
+		// Verify defaults
+		case "VERIFY_WORKERS":
+			if n, err := strconv.Atoi(val); err == nil && n > 0 {
+				cfg.VerifyWorkers = n
+			}
+		case "VERIFY_QUICK":
+			cfg.VerifyQuick = val == "yes"
+
+		// Thermal protection
+		case "THERMAL_ENABLED":
+			cfg.ThermalEnabled = val == "yes"
+		case "THERMAL_POLL_SECS":
+			if n, err := strconv.Atoi(val); err == nil && n > 0 {
+				cfg.ThermalPollSecs = n
+			}
+		case "THERMAL_HDD_PAUSE":
+			if n, err := strconv.Atoi(val); err == nil && n > 0 {
+				cfg.ThermalHddPause = n
+			}
+		case "THERMAL_HDD_RESUME":
+			if n, err := strconv.Atoi(val); err == nil && n > 0 {
+				cfg.ThermalHddResume = n
+			}
+		case "THERMAL_SSD_PAUSE":
+			if n, err := strconv.Atoi(val); err == nil && n > 0 {
+				cfg.ThermalSsdPause = n
+			}
+		case "THERMAL_SSD_RESUME":
+			if n, err := strconv.Atoi(val); err == nil && n > 0 {
+				cfg.ThermalSsdResume = n
+			}
 		}
 	}
 	return cfg
 }
 
-func writeCronConfig(cfg cronConfig) error {
-	enabled := "no"
-	if cfg.Enabled {
-		enabled = "yes"
-	}
-	content := fmt.Sprintf(`# filehasher cron schedule
+func writeAppConfig(cfg appConfig) error {
+	// Encode newlines in excludes as literal \n for single-line storage
+	excludesEncoded := strings.ReplaceAll(cfg.ScanExcludes, "\n", `\n`)
+
+	content := fmt.Sprintf(`# filehasher settings
 # Set ENABLED=yes to enable automatic verification
 ENABLED=%s
 # Cron schedule (default: Sunday 3 AM)
 SCHEDULE=%s
-# Verify mode: "full" or "quick"
+# Verify mode for scheduled runs: "full" or "quick"
 MODE=%s
-`, enabled, cfg.Schedule, cfg.Mode)
+
+# Scan defaults
+SCAN_EXCLUDES=%s
+SCAN_EXCLUDE_APPDATA=%s
+SCAN_FULL=%s
+SCAN_HDD_TWO_PHASE=%s
+SCAN_DISK_TYPE=%s
+
+# Verify defaults
+VERIFY_WORKERS=%d
+VERIFY_QUICK=%s
+
+# Thermal protection
+THERMAL_ENABLED=%s
+THERMAL_POLL_SECS=%d
+THERMAL_HDD_PAUSE=%d
+THERMAL_HDD_RESUME=%d
+THERMAL_SSD_PAUSE=%d
+THERMAL_SSD_RESUME=%d
+`,
+		boolToYesNo(cfg.Enabled), cfg.Schedule, cfg.Mode,
+		excludesEncoded, boolToYesNo(cfg.ScanExcludeAppdata),
+		boolToYesNo(cfg.ScanFull), boolToYesNo(cfg.ScanHddTwoPhase), cfg.ScanDiskType,
+		cfg.VerifyWorkers, boolToYesNo(cfg.VerifyQuick),
+		boolToYesNo(cfg.ThermalEnabled), cfg.ThermalPollSecs,
+		cfg.ThermalHddPause, cfg.ThermalHddResume,
+		cfg.ThermalSsdPause, cfg.ThermalSsdResume,
+	)
 
 	if err := os.MkdirAll("/boot/config/filehasher", 0755); err != nil {
 		return err
 	}
-	if err := os.WriteFile(cronCfgPath, []byte(content), 0644); err != nil {
+	if err := os.WriteFile(cfgPath, []byte(content), 0644); err != nil {
 		return err
 	}
 
@@ -333,22 +449,109 @@ MODE=%s
 	return nil
 }
 
+// toScanOptions converts saved config to ScanOptions.
+func (c appConfig) toScanOptions() ScanOptions {
+	var excludes []string
+	for _, line := range strings.Split(c.ScanExcludes, "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			excludes = append(excludes, line)
+		}
+	}
+	return ScanOptions{
+		Excludes:       excludes,
+		ExcludeAppdata: c.ScanExcludeAppdata,
+		FullScan:       c.ScanFull,
+		HddTwoPhase:    c.ScanHddTwoPhase,
+		DiskType:       c.ScanDiskType,
+	}
+}
+
+// toVerifyOptions converts saved config to VerifyOptions.
+func (c appConfig) toVerifyOptions() VerifyOptions {
+	return VerifyOptions{
+		Workers: c.VerifyWorkers,
+		Quick:   c.VerifyQuick,
+	}
+}
+
+// toThermalConfig converts saved config to ThermalConfig.
+func (c appConfig) toThermalConfig() ThermalConfig {
+	return ThermalConfig{
+		Enabled:   c.ThermalEnabled,
+		PollSecs:  c.ThermalPollSecs,
+		HddPause:  c.ThermalHddPause,
+		HddResume: c.ThermalHddResume,
+		SsdPause:  c.ThermalSsdPause,
+		SsdResume: c.ThermalSsdResume,
+	}
+}
+
 func handleSettings() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
 			r.ParseForm()
-			cfg := cronConfig{
-				Enabled:  r.FormValue("enabled") == "yes",
-				Schedule: r.FormValue("schedule"),
-				Mode:     r.FormValue("mode"),
-			}
+
+			cfg := defaultAppConfig()
+
+			// Scheduled verification
+			cfg.Enabled = r.FormValue("enabled") == "yes"
+			cfg.Schedule = r.FormValue("schedule")
+			cfg.Mode = r.FormValue("mode")
 			if cfg.Schedule == "" {
 				cfg.Schedule = "0 3 * * 0"
 			}
 			if cfg.Mode == "" {
 				cfg.Mode = "full"
 			}
-			err := writeCronConfig(cfg)
+
+			// Scan defaults
+			cfg.ScanExcludes = r.FormValue("scan_excludes")
+			cfg.ScanExcludeAppdata = r.FormValue("scan_exclude_appdata") == "yes"
+			cfg.ScanFull = r.FormValue("scan_full") == "yes"
+			cfg.ScanHddTwoPhase = r.FormValue("scan_hdd_two_phase") == "yes"
+			cfg.ScanDiskType = r.FormValue("scan_disk_type")
+			if cfg.ScanDiskType == "" {
+				cfg.ScanDiskType = "auto"
+			}
+
+			// Verify defaults
+			if v := r.FormValue("verify_workers"); v != "" {
+				if n, err := strconv.Atoi(v); err == nil && n > 0 {
+					cfg.VerifyWorkers = n
+				}
+			}
+			cfg.VerifyQuick = r.FormValue("verify_quick") == "yes"
+
+			// Thermal protection
+			cfg.ThermalEnabled = r.FormValue("thermal_enabled") == "yes"
+			if v := r.FormValue("thermal_poll_secs"); v != "" {
+				if n, err := strconv.Atoi(v); err == nil && n > 0 {
+					cfg.ThermalPollSecs = n
+				}
+			}
+			if v := r.FormValue("thermal_hdd_pause"); v != "" {
+				if n, err := strconv.Atoi(v); err == nil && n > 0 {
+					cfg.ThermalHddPause = n
+				}
+			}
+			if v := r.FormValue("thermal_hdd_resume"); v != "" {
+				if n, err := strconv.Atoi(v); err == nil && n > 0 {
+					cfg.ThermalHddResume = n
+				}
+			}
+			if v := r.FormValue("thermal_ssd_pause"); v != "" {
+				if n, err := strconv.Atoi(v); err == nil && n > 0 {
+					cfg.ThermalSsdPause = n
+				}
+			}
+			if v := r.FormValue("thermal_ssd_resume"); v != "" {
+				if n, err := strconv.Atoi(v); err == nil && n > 0 {
+					cfg.ThermalSsdResume = n
+				}
+			}
+
+			err := writeAppConfig(cfg)
 			msg := "Settings saved successfully."
 			if err != nil {
 				msg = fmt.Sprintf("Error saving settings: %v", err)
@@ -362,7 +565,7 @@ func handleSettings() http.HandlerFunc {
 			return
 		}
 
-		cfg := readCronConfig()
+		cfg := readAppConfig()
 		data := map[string]interface{}{
 			"Page":   "settings",
 			"Config": cfg,
@@ -403,7 +606,41 @@ func handleAPIScan(runner *Runner) http.HandlerFunc {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		if err := runner.StartScan(); err != nil {
+
+		// Load saved defaults
+		cfg := readAppConfig()
+		opts := cfg.toScanOptions()
+		thermal := cfg.toThermalConfig()
+
+		// Parse optional JSON overrides from request body
+		if r.Body != nil && r.ContentLength > 0 {
+			var body struct {
+				Excludes       *[]string `json:"excludes"`
+				ExcludeAppdata *bool     `json:"excludeAppdata"`
+				FullScan       *bool     `json:"fullScan"`
+				HddTwoPhase    *bool     `json:"hddTwoPhase"`
+				DiskType       *string   `json:"diskType"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
+				if body.Excludes != nil {
+					opts.Excludes = *body.Excludes
+				}
+				if body.ExcludeAppdata != nil {
+					opts.ExcludeAppdata = *body.ExcludeAppdata
+				}
+				if body.FullScan != nil {
+					opts.FullScan = *body.FullScan
+				}
+				if body.HddTwoPhase != nil {
+					opts.HddTwoPhase = *body.HddTwoPhase
+				}
+				if body.DiskType != nil {
+					opts.DiskType = *body.DiskType
+				}
+			}
+		}
+
+		if err := runner.StartScan(opts, thermal); err != nil {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusConflict)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
@@ -420,7 +657,29 @@ func handleAPIVerify(runner *Runner) http.HandlerFunc {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		if err := runner.StartVerify(); err != nil {
+
+		// Load saved defaults
+		cfg := readAppConfig()
+		opts := cfg.toVerifyOptions()
+		thermal := cfg.toThermalConfig()
+
+		// Parse optional JSON overrides from request body
+		if r.Body != nil && r.ContentLength > 0 {
+			var body struct {
+				Workers *int  `json:"workers"`
+				Quick   *bool `json:"quick"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
+				if body.Workers != nil && *body.Workers > 0 {
+					opts.Workers = *body.Workers
+				}
+				if body.Quick != nil {
+					opts.Quick = *body.Quick
+				}
+			}
+		}
+
+		if err := runner.StartVerify(opts, thermal); err != nil {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusConflict)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
@@ -428,6 +687,25 @@ func handleAPIVerify(runner *Runner) http.HandlerFunc {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"status": "started"})
+	}
+}
+
+// handleAPIConfig returns the current config as JSON for the JS options panel.
+func handleAPIConfig() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		cfg := readAppConfig()
+		resp := struct {
+			Scan    ScanOptions   `json:"scan"`
+			Verify  VerifyOptions `json:"verify"`
+			Thermal ThermalConfig `json:"thermal"`
+		}{
+			Scan:    cfg.toScanOptions(),
+			Verify:  cfg.toVerifyOptions(),
+			Thermal: cfg.toThermalConfig(),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		json.NewEncoder(w).Encode(resp)
 	}
 }
 

@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,8 +14,82 @@ import (
 	"github.com/maisi/unraid-filehasher/internal/db"
 	"github.com/maisi/unraid-filehasher/internal/hasher"
 	"github.com/maisi/unraid-filehasher/internal/scanner"
+	"github.com/maisi/unraid-filehasher/internal/thermal"
 	"github.com/maisi/unraid-filehasher/internal/verifier"
 )
+
+// ScanOptions holds per-operation scan parameters.
+type ScanOptions struct {
+	Excludes       []string `json:"excludes"`
+	ExcludeAppdata bool     `json:"excludeAppdata"`
+	FullScan       bool     `json:"fullScan"`
+	HddTwoPhase    bool     `json:"hddTwoPhase"`
+	DiskType       string   `json:"diskType"`
+}
+
+// VerifyOptions holds per-operation verify parameters.
+type VerifyOptions struct {
+	Workers int  `json:"workers"`
+	Quick   bool `json:"quick"`
+}
+
+// ThermalConfig holds thermal protection parameters.
+type ThermalConfig struct {
+	Enabled   bool `json:"enabled"`
+	PollSecs  int  `json:"pollSecs"`
+	HddPause  int  `json:"hddPause"`
+	HddResume int  `json:"hddResume"`
+	SsdPause  int  `json:"ssdPause"`
+	SsdResume int  `json:"ssdResume"`
+}
+
+// diskThermalState tracks per-disk thermal pause state.
+type diskThermalState struct {
+	paused int32         // atomic: 1 = paused, 0 = running
+	temp   int32         // atomic: current temperature (-1 = unavailable)
+	ch     chan struct{} // closed when unpaused, re-created on pause
+	mu     sync.Mutex
+}
+
+func newDiskThermalState() *diskThermalState {
+	ch := make(chan struct{})
+	close(ch) // start unpaused — closed channel never blocks
+	return &diskThermalState{ch: ch, temp: -1}
+}
+
+// pause sets the disk to paused state. File-feeding goroutines will block.
+func (d *diskThermalState) pause() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if atomic.LoadInt32(&d.paused) == 0 {
+		atomic.StoreInt32(&d.paused, 1)
+		d.ch = make(chan struct{}) // open channel blocks receivers
+	}
+}
+
+// resume unpauses the disk.
+func (d *diskThermalState) resume() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if atomic.LoadInt32(&d.paused) == 1 {
+		atomic.StoreInt32(&d.paused, 0)
+		close(d.ch) // unblock all waiters
+	}
+}
+
+// waitIfPaused blocks until the disk is unpaused, or ctx is cancelled.
+// Returns ctx.Err() if the context was cancelled while waiting.
+func (d *diskThermalState) waitIfPaused(ctx context.Context) error {
+	d.mu.Lock()
+	ch := d.ch
+	d.mu.Unlock()
+	select {
+	case <-ch:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
 
 // RunnerState represents the current operation state.
 type RunnerState string
@@ -33,6 +108,8 @@ type DiskProgress struct {
 	FilesDone  int64  `json:"filesDone"`  // files hashed/verified so far
 	BytesTotal int64  `json:"bytesTotal"` // total bytes to hash (accumulated during walk)
 	BytesDone  int64  `json:"bytesDone"`  // bytes hashed so far
+	Temp       int    `json:"temp"`       // current temperature (-1 = unavailable)
+	Paused     bool   `json:"paused"`     // true if thermally paused
 }
 
 // RunnerProgress holds current progress information.
@@ -141,7 +218,7 @@ func (r *Runner) Stop() error {
 }
 
 // StartScan begins a background scan operation. Returns an error if already busy.
-func (r *Runner) StartScan() error {
+func (r *Runner) StartScan(opts ScanOptions, thermal ThermalConfig) error {
 	r.mu.Lock()
 	if r.progress.State != StateIdle {
 		r.mu.Unlock()
@@ -157,12 +234,12 @@ func (r *Runner) StartScan() error {
 	r.mu.Unlock()
 	r.notify(r.Progress())
 
-	go r.runScan(ctx)
+	go r.runScan(ctx, opts, thermal)
 	return nil
 }
 
 // StartVerify begins a background verify operation. Returns an error if already busy.
-func (r *Runner) StartVerify() error {
+func (r *Runner) StartVerify(opts VerifyOptions, thermal ThermalConfig) error {
 	r.mu.Lock()
 	if r.progress.State != StateIdle {
 		r.mu.Unlock()
@@ -178,7 +255,7 @@ func (r *Runner) StartVerify() error {
 	r.mu.Unlock()
 	r.notify(r.Progress())
 
-	go r.runVerify(ctx)
+	go r.runVerify(ctx, opts, thermal)
 	return nil
 }
 
@@ -201,7 +278,7 @@ func (r *Runner) finishOperation(phase string, done, total, errors int64, messag
 	r.notify(snap)
 }
 
-func (r *Runner) runScan(ctx context.Context) {
+func (r *Runner) runScan(ctx context.Context, opts ScanOptions, thermalCfg ThermalConfig) {
 	// Detect Unraid disks
 	disks, err := scanner.DetectUnraidDisks()
 	if err != nil || len(disks) == 0 {
@@ -213,6 +290,20 @@ func (r *Runner) runScan(ctx context.Context) {
 		return
 	}
 
+	// Apply disk type override
+	switch strings.ToLower(strings.TrimSpace(opts.DiskType)) {
+	case "hdd":
+		for i := range disks {
+			disks[i].Type = scanner.DiskTypeHDD
+		}
+	case "ssd":
+		for i := range disks {
+			disks[i].Type = scanner.DiskTypeSSD
+		}
+	default:
+		// "auto" or empty — keep detected types
+	}
+
 	// Initialize per-disk progress
 	diskProgressMap := make(map[string]*DiskProgress, len(disks))
 	diskProgressList := make([]DiskProgress, len(disks))
@@ -220,6 +311,7 @@ func (r *Runner) runScan(ctx context.Context) {
 		diskProgressList[i] = DiskProgress{
 			Disk:  d.Name,
 			Phase: "walking",
+			Temp:  -1,
 		}
 		diskProgressMap[d.Name] = &diskProgressList[i]
 	}
@@ -243,15 +335,24 @@ func (r *Runner) runScan(ctx context.Context) {
 	default:
 	}
 
-	// Load lookup map for incremental scan
-	lookupMap, err := r.db.LoadQuickLookupMap()
-	if err != nil {
-		r.finishOperation("error", 0, 0, 0, fmt.Sprintf("load lookup map: %v", err), nil)
-		return
+	// Load lookup map for incremental scan (unless full scan requested)
+	var lookupMap map[string]*db.QuickLookup
+	if !opts.FullScan {
+		lookupMap, err = r.db.LoadQuickLookupMap()
+		if err != nil {
+			r.finishOperation("error", 0, 0, 0, fmt.Sprintf("load lookup map: %v", err), nil)
+			return
+		}
 	}
 
-	// Create scanner with no excludes (web scan uses defaults)
-	sc, err := scanner.New(nil)
+	// Build exclude patterns
+	excludePatterns := append([]string{}, opts.Excludes...)
+	if opts.ExcludeAppdata {
+		excludePatterns = append(excludePatterns, `(^|/)(appdata)(/|$)`)
+	}
+
+	// Create scanner with configured excludes
+	sc, err := scanner.New(excludePatterns)
 	if err != nil {
 		r.finishOperation("error", 0, 0, 0, fmt.Sprintf("create scanner: %v", err), nil)
 		return
@@ -270,6 +371,22 @@ func (r *Runner) runScan(ctx context.Context) {
 	var skipped int64
 	var totalProcessed int64
 	var totalErrors int64
+
+	// Set up per-disk thermal state
+	thermalStates := make(map[string]*diskThermalState, len(disks))
+	diskTypes := make(map[string]scanner.DiskType, len(disks))
+	for _, d := range disks {
+		thermalStates[d.Name] = newDiskThermalState()
+		diskTypes[d.Name] = d.Type
+	}
+
+	// Start thermal monitor if enabled
+	var thermalCancel context.CancelFunc
+	if thermalCfg.Enabled {
+		var thermalCtx context.Context
+		thermalCtx, thermalCancel = context.WithCancel(ctx)
+		go r.thermalMonitor(thermalCtx, thermalCfg, thermalStates, diskTypes, diskProgressMap)
+	}
 
 	// Launch per-disk pipelines
 	var pipelineWg sync.WaitGroup
@@ -292,47 +409,114 @@ func (r *Runner) runScan(ctx context.Context) {
 
 		disk := d
 		dp := diskProgressMap[disk.Name]
-		go func() {
-			defer close(diskInput)
+		ts := thermalStates[disk.Name]
 
-			scanned := make(chan hasher.FileInfo, workers*4)
+		// HDD two-phase: walk first, collect all eligible files, then hash sequentially
+		if opts.HddTwoPhase && disk.Type == scanner.DiskTypeHDD {
 			go func() {
-				defer close(scanned)
-				if err := sc.WalkContext(ctx, disk.Path, disk.Name, scanned); err != nil {
-					r.updateProgress(func(p *RunnerProgress) {
-						p.Message = fmt.Sprintf("error scanning %s: %v", disk.Path, err)
-					})
+				defer close(diskInput)
+
+				scanned := make(chan hasher.FileInfo, workers*4)
+				go func() {
+					defer close(scanned)
+					if err := sc.WalkContext(ctx, disk.Path, disk.Name, scanned); err != nil {
+						r.updateProgress(func(p *RunnerProgress) {
+							p.Message = fmt.Sprintf("error scanning %s: %v", disk.Path, err)
+						})
+					}
+				}()
+
+				// Phase 1: collect
+				var list []hasher.FileInfo
+				for fi := range scanned {
+					select {
+					case <-ctx.Done():
+						return
+					default:
+					}
+
+					// Incremental check
+					if lookupMap != nil {
+						if existing, ok := lookupMap[fi.Path]; ok {
+							if existing.Size == fi.Size && existing.Mtime == fi.Mtime {
+								atomic.AddInt64(&skipped, 1)
+								continue
+							}
+						}
+					}
+
+					atomic.AddInt64(&dp.FilesFound, 1)
+					atomic.AddInt64(&dp.BytesTotal, fi.Size)
+					list = append(list, fi)
+				}
+
+				dp.Phase = "hashing"
+
+				// Phase 2: feed sequentially (respecting thermal pause)
+				for _, fi := range list {
+					if err := ts.waitIfPaused(ctx); err != nil {
+						return
+					}
+					select {
+					case <-ctx.Done():
+						return
+					case diskInput <- fi:
+					}
 				}
 			}()
+		} else {
+			// Default: stream walk -> hash pipeline
+			go func() {
+				defer close(diskInput)
 
-			for fi := range scanned {
-				// Check for cancellation
-				select {
-				case <-ctx.Done():
-					return
-				default:
-				}
+				scanned := make(chan hasher.FileInfo, workers*4)
+				go func() {
+					defer close(scanned)
+					if err := sc.WalkContext(ctx, disk.Path, disk.Name, scanned); err != nil {
+						r.updateProgress(func(p *RunnerProgress) {
+							p.Message = fmt.Sprintf("error scanning %s: %v", disk.Path, err)
+						})
+					}
+				}()
 
-				// Incremental check
-				if lookupMap != nil {
-					if existing, ok := lookupMap[fi.Path]; ok {
-						if existing.Size == fi.Size && existing.Mtime == fi.Mtime {
-							atomic.AddInt64(&skipped, 1)
-							continue
+				for fi := range scanned {
+					// Check for cancellation
+					select {
+					case <-ctx.Done():
+						return
+					default:
+					}
+
+					// Thermal pause
+					if err := ts.waitIfPaused(ctx); err != nil {
+						return
+					}
+
+					// Incremental check
+					if lookupMap != nil {
+						if existing, ok := lookupMap[fi.Path]; ok {
+							if existing.Size == fi.Size && existing.Mtime == fi.Mtime {
+								atomic.AddInt64(&skipped, 1)
+								continue
+							}
 						}
+					}
+
+					// Track per-disk walk progress
+					atomic.AddInt64(&dp.FilesFound, 1)
+					atomic.AddInt64(&dp.BytesTotal, fi.Size)
+
+					select {
+					case <-ctx.Done():
+						return
+					case diskInput <- fi:
 					}
 				}
 
-				// Track per-disk walk progress
-				atomic.AddInt64(&dp.FilesFound, 1)
-				atomic.AddInt64(&dp.BytesTotal, fi.Size)
-
-				diskInput <- fi
-			}
-
-			// Mark disk walk as complete, transition to hashing
-			dp.Phase = "hashing"
-		}()
+				// Mark disk walk as complete, transition to hashing
+				dp.Phase = "hashing"
+			}()
+		}
 	}
 
 	go func() {
@@ -347,6 +531,9 @@ func (r *Runner) runScan(ctx context.Context) {
 	// Process results
 	tx, txErr := r.db.BeginBatch()
 	if txErr != nil {
+		if thermalCancel != nil {
+			thermalCancel()
+		}
 		r.finishOperation("error", 0, 0, 0, fmt.Sprintf("begin transaction: %v", txErr), nil)
 		return
 	}
@@ -433,12 +620,18 @@ func (r *Runner) runScan(ctx context.Context) {
 		batchCount++
 		if batchCount >= batchSize {
 			if err := tx.Commit(); err != nil {
+				if thermalCancel != nil {
+					thermalCancel()
+				}
 				r.finishOperation("error", atomic.LoadInt64(&totalProcessed), 0, atomic.LoadInt64(&totalErrors),
 					fmt.Sprintf("commit batch: %v", err), cloneDiskProgress(diskProgressList))
 				return
 			}
 			tx, txErr = r.db.BeginBatch()
 			if txErr != nil {
+				if thermalCancel != nil {
+					thermalCancel()
+				}
 				r.finishOperation("error", atomic.LoadInt64(&totalProcessed), 0, atomic.LoadInt64(&totalErrors),
 					fmt.Sprintf("begin new batch: %v", txErr), cloneDiskProgress(diskProgressList))
 				return
@@ -467,6 +660,11 @@ func (r *Runner) runScan(ctx context.Context) {
 				p.Message = fmt.Sprintf("Hashed %d files, skipped %d, %d errors", processed, skip, errors)
 			})
 		}
+	}
+
+	// Stop thermal monitor
+	if thermalCancel != nil {
+		thermalCancel()
 	}
 
 	// Handle cancellation
@@ -526,9 +724,9 @@ func (r *Runner) runScan(ctx context.Context) {
 		cloneDiskProgress(diskProgressList))
 }
 
-func (r *Runner) runVerify(ctx context.Context) {
+func (r *Runner) runVerify(ctx context.Context, opts VerifyOptions, thermalCfg ThermalConfig) {
 	scanID, _ := r.db.InsertScanHistory("verify", "")
-	v := verifier.New(r.db, 4, false)
+	v := verifier.New(r.db, opts.Workers, opts.Quick)
 
 	// Load files to build per-disk progress
 	allFiles, err := r.db.GetAllFiles()
@@ -646,7 +844,87 @@ func cloneDiskProgress(src []DiskProgress) []DiskProgress {
 			FilesDone:  atomic.LoadInt64(&src[i].FilesDone),
 			BytesTotal: atomic.LoadInt64(&src[i].BytesTotal),
 			BytesDone:  atomic.LoadInt64(&src[i].BytesDone),
+			Temp:       src[i].Temp,
+			Paused:     src[i].Paused,
 		}
 	}
 	return dst
+}
+
+// thermalMonitor polls disk temperatures and pauses/resumes per-disk hashing.
+// It runs in a goroutine until ctx is cancelled.
+func (r *Runner) thermalMonitor(
+	ctx context.Context,
+	cfg ThermalConfig,
+	states map[string]*diskThermalState,
+	diskTypes map[string]scanner.DiskType,
+	progressMap map[string]*DiskProgress,
+) {
+	pollInterval := time.Duration(cfg.PollSecs) * time.Second
+	if pollInterval < 10*time.Second {
+		pollInterval = 10 * time.Second
+	}
+
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	diskNames := make([]string, 0, len(states))
+	for name := range states {
+		diskNames = append(diskNames, name)
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			temps := thermal.ReadTemperatures(diskNames)
+
+			for name, reading := range temps {
+				dp, ok := progressMap[name]
+				if !ok {
+					continue
+				}
+				ts, ok := states[name]
+				if !ok {
+					continue
+				}
+
+				if !reading.Available {
+					atomic.StoreInt32(&ts.temp, -1)
+					dp.Temp = -1
+					continue
+				}
+
+				atomic.StoreInt32(&ts.temp, int32(reading.Temp))
+				dp.Temp = reading.Temp
+
+				// Determine thresholds based on disk type
+				pauseTemp := cfg.HddPause
+				resumeTemp := cfg.HddResume
+				dt := diskTypes[name]
+				if dt == scanner.DiskTypeSSD {
+					pauseTemp = cfg.SsdPause
+					resumeTemp = cfg.SsdResume
+				}
+
+				isPaused := atomic.LoadInt32(&ts.paused) == 1
+
+				if !isPaused && reading.Temp >= pauseTemp {
+					ts.pause()
+					dp.Paused = true
+					log.Printf("thermal: pausing %s at %d°C (threshold %d°C)", name, reading.Temp, pauseTemp)
+				} else if isPaused && reading.Temp <= resumeTemp {
+					ts.resume()
+					dp.Paused = false
+					log.Printf("thermal: resuming %s at %d°C (threshold %d°C)", name, reading.Temp, resumeTemp)
+				}
+			}
+
+			// Push a progress update so SSE clients see temperature changes
+			r.updateProgress(func(p *RunnerProgress) {
+				// The disk progress slice is shared; just trigger a clone+notify
+			})
+		}
+	}
 }

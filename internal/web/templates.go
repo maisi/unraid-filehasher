@@ -299,6 +299,100 @@ var baseTemplate = `<!DOCTYPE html>
             color: #d29922;
         }
 
+        /* Thermal badge */
+        .temp-badge {
+            display: inline-block;
+            font-size: 11px;
+            padding: 1px 6px;
+            border-radius: 4px;
+            font-weight: 600;
+            margin-left: 4px;
+        }
+        .temp-badge.temp-ok { color: #8b949e; }
+        .temp-badge.temp-warm { color: #d29922; }
+        .temp-badge.temp-hot {
+            color: #f85149;
+            background: rgba(248, 81, 73, 0.15);
+        }
+        .temp-badge.temp-paused {
+            color: #f85149;
+            background: rgba(248, 81, 73, 0.2);
+            animation: pulse 1.5s ease-in-out infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        /* Options panel */
+        .options-toggle {
+            font-size: 12px;
+            color: #8b949e;
+            cursor: pointer;
+            user-select: none;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+        }
+        .options-toggle:hover { color: #c9d1d9; }
+        .options-panel {
+            display: none;
+            margin-top: 12px;
+            padding: 16px;
+            background: #0d1117;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+        }
+        .options-panel.open { display: block; }
+        .options-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px 24px;
+        }
+        .opt-group { margin-bottom: 0; }
+        .opt-group label {
+            display: block;
+            font-size: 11px;
+            text-transform: uppercase;
+            color: #8b949e;
+            margin-bottom: 4px;
+        }
+        .opt-group input[type="number"],
+        .opt-group input[type="text"],
+        .opt-group select,
+        .opt-group textarea {
+            width: 100%;
+            padding: 6px 10px;
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 4px;
+            color: #c9d1d9;
+            font-size: 13px;
+            font-family: inherit;
+        }
+        .opt-group textarea {
+            font-family: "SFMono-Regular", Consolas, monospace;
+            font-size: 12px;
+            resize: vertical;
+            min-height: 60px;
+        }
+        .opt-check {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            cursor: pointer;
+            font-size: 13px;
+        }
+        .opt-check input { width: 14px; height: 14px; }
+
+        /* Settings cards */
+        .settings-grid {
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 16px;
+            max-width: 640px;
+        }
+
         /* Elapsed time */
         .progress-header {
             display: flex;
@@ -408,7 +502,40 @@ var baseTemplate = `<!DOCTYPE html>
     function startOp(type) {
         var btn = document.getElementById("btn-" + type);
         if (btn) btn.disabled = true;
-        fetch("/api/" + type, {method: "POST"})
+
+        // Collect options from the options panel (if present)
+        var body = null;
+        var headers = {};
+        var panel = document.getElementById("options-panel");
+        if (panel) {
+            if (type === "scan") {
+                var opts = {};
+                var exclEl = document.getElementById("opt-excludes");
+                if (exclEl && exclEl.value.trim()) {
+                    opts.excludes = exclEl.value.trim().split("\n").filter(function(l){return l.trim();});
+                }
+                var exclApp = document.getElementById("opt-exclude-appdata");
+                if (exclApp) opts.excludeAppdata = exclApp.checked;
+                var fullEl = document.getElementById("opt-full-scan");
+                if (fullEl) opts.fullScan = fullEl.checked;
+                var twoPhase = document.getElementById("opt-hdd-two-phase");
+                if (twoPhase) opts.hddTwoPhase = twoPhase.checked;
+                var dtEl = document.getElementById("opt-disk-type");
+                if (dtEl) opts.diskType = dtEl.value;
+                body = JSON.stringify(opts);
+                headers["Content-Type"] = "application/json";
+            } else if (type === "verify") {
+                var opts = {};
+                var wEl = document.getElementById("opt-workers");
+                if (wEl && wEl.value) opts.workers = parseInt(wEl.value, 10);
+                var qEl = document.getElementById("opt-quick");
+                if (qEl) opts.quick = qEl.checked;
+                body = JSON.stringify(opts);
+                headers["Content-Type"] = "application/json";
+            }
+        }
+
+        fetch("/api/" + type, {method: "POST", body: body, headers: headers})
             .then(function(r) { return r.json(); })
             .then(function(d) {
                 if (d.error) { alert(d.error); if (btn) btn.disabled = false; }
@@ -480,8 +607,19 @@ var baseTemplate = `<!DOCTYPE html>
                 statsText = d.filesDone + " / " + d.filesFound + " files";
             }
 
+            // Temperature badge
+            var tempBadge = "";
+            if (d.paused && d.temp >= 0) {
+                tempBadge = ' <span class="temp-badge temp-paused">PAUSED ' + d.temp + '\u00B0C</span>';
+            } else if (d.temp >= 0) {
+                var tClass = "temp-ok";
+                if (d.temp >= 55) tClass = "temp-hot";
+                else if (d.temp >= 45) tClass = "temp-warm";
+                tempBadge = ' <span class="temp-badge ' + tClass + '">' + d.temp + '\u00B0C</span>';
+            }
+
             html += '<div class="disk-progress-row">';
-            html += '<div><span class="disk-progress-name">' + d.disk + '</span> <span class="' + phaseClass + '">' + d.phase + '</span></div>';
+            html += '<div><span class="disk-progress-name">' + d.disk + '</span> <span class="' + phaseClass + '">' + d.phase + '</span>' + tempBadge + '</div>';
             html += '<div class="disk-progress-bar-wrap">';
             html += '<div class="progress-bar-container"><div class="' + barClass + '" style="width:' + pct + '%"></div></div>';
             html += '<span class="disk-progress-pct">' + pct + '%</span>';
@@ -617,8 +755,72 @@ var baseTemplate = `<!DOCTYPE html>
     // On page load, check if an operation is running
     (function() {
         if (!document.getElementById("progress-section")) return;
+        loadDefaults();
         connectSSE();
     })();
+
+    // --- Options panel ---
+    function toggleOptions() {
+        var panel = document.getElementById("options-panel");
+        var arrow = document.getElementById("options-arrow");
+        if (!panel) return;
+        if (panel.classList.contains("open")) {
+            panel.classList.remove("open");
+            if (arrow) arrow.innerHTML = "&#9654;";
+        } else {
+            panel.classList.add("open");
+            if (arrow) arrow.innerHTML = "&#9660;";
+        }
+    }
+
+    function switchOptTab(tab) {
+        var scanTab = document.getElementById("opt-tab-scan");
+        var verifyTab = document.getElementById("opt-tab-verify");
+        var btnScan = document.getElementById("tab-scan");
+        var btnVerify = document.getElementById("tab-verify");
+        if (tab === "scan") {
+            if (scanTab) scanTab.style.display = "";
+            if (verifyTab) verifyTab.style.display = "none";
+            if (btnScan) { btnScan.className = "btn btn-primary"; }
+            if (btnVerify) { btnVerify.className = "btn"; }
+        } else {
+            if (scanTab) scanTab.style.display = "none";
+            if (verifyTab) verifyTab.style.display = "";
+            if (btnScan) { btnScan.className = "btn"; }
+            if (btnVerify) { btnVerify.className = "btn btn-primary"; }
+        }
+    }
+
+    function loadDefaults() {
+        fetch("/api/config")
+            .then(function(r) { return r.json(); })
+            .then(function(cfg) {
+                // Scan defaults
+                var el;
+                if (cfg.scan) {
+                    el = document.getElementById("opt-excludes");
+                    if (el && cfg.scan.excludes && cfg.scan.excludes.length > 0) {
+                        el.value = cfg.scan.excludes.join("\n");
+                    }
+                    el = document.getElementById("opt-exclude-appdata");
+                    if (el) el.checked = !!cfg.scan.excludeAppdata;
+                    el = document.getElementById("opt-full-scan");
+                    if (el) el.checked = !!cfg.scan.fullScan;
+                    el = document.getElementById("opt-hdd-two-phase");
+                    if (el) el.checked = !!cfg.scan.hddTwoPhase;
+                    el = document.getElementById("opt-disk-type");
+                    if (el && cfg.scan.diskType) el.value = cfg.scan.diskType;
+                }
+                // Verify defaults
+                if (cfg.verify) {
+                    el = document.getElementById("opt-workers");
+                    if (el && cfg.verify.workers) el.value = cfg.verify.workers;
+                    el = document.getElementById("opt-quick");
+                    if (el) el.checked = !!cfg.verify.quick;
+                }
+            })
+            .catch(function() { /* ignore - defaults are fine */ });
+    }
     </script>
 </body>
 </html>`
@@ -660,6 +862,61 @@ var templates = map[string]string{
         <button id="btn-scan" class="btn btn-primary" onclick="startOp('scan')">Start Scan</button>
         <button id="btn-verify" class="btn btn-primary" onclick="startOp('verify')">Start Verify</button>
         <button id="btn-stop" class="btn btn-danger" onclick="stopOp()" style="display:none;">Stop</button>
+    </div>
+    <div style="margin-bottom:12px;">
+        <span class="options-toggle" onclick="toggleOptions()">
+            <span id="options-arrow">&#9654;</span> Options
+        </span>
+    </div>
+    <div id="options-panel" class="options-panel">
+        <div style="display:flex;gap:12px;margin-bottom:12px;">
+            <span id="tab-scan" class="btn btn-primary" style="padding:4px 12px;font-size:12px;cursor:pointer;" onclick="switchOptTab('scan')">Scan</span>
+            <span id="tab-verify" class="btn" style="padding:4px 12px;font-size:12px;cursor:pointer;" onclick="switchOptTab('verify')">Verify</span>
+        </div>
+        <!-- Scan options tab -->
+        <div id="opt-tab-scan" class="options-grid">
+            <div class="opt-group" style="grid-column:1/3;">
+                <label>Exclude Patterns (one regex per line)</label>
+                <textarea id="opt-excludes" rows="3" placeholder="\.tmp$&#10;/\.Trash-"></textarea>
+            </div>
+            <div style="display:flex;flex-direction:column;gap:8px;">
+                <label class="opt-check">
+                    <input type="checkbox" id="opt-exclude-appdata">
+                    <span>Exclude appdata</span>
+                </label>
+                <label class="opt-check">
+                    <input type="checkbox" id="opt-full-scan">
+                    <span>Full scan</span>
+                </label>
+            </div>
+            <div style="display:flex;flex-direction:column;gap:8px;">
+                <label class="opt-check">
+                    <input type="checkbox" id="opt-hdd-two-phase">
+                    <span>HDD two-phase</span>
+                </label>
+                <div class="opt-group">
+                    <label>Disk Type</label>
+                    <select id="opt-disk-type">
+                        <option value="auto">Auto-detect</option>
+                        <option value="hdd">HDD</option>
+                        <option value="ssd">SSD</option>
+                    </select>
+                </div>
+            </div>
+        </div>
+        <!-- Verify options tab -->
+        <div id="opt-tab-verify" class="options-grid" style="display:none;">
+            <div class="opt-group">
+                <label>Worker Threads</label>
+                <input type="number" id="opt-workers" min="1" max="64" value="4" style="max-width:80px;">
+            </div>
+            <div style="padding-top:18px;">
+                <label class="opt-check">
+                    <input type="checkbox" id="opt-quick">
+                    <span>Quick verify</span>
+                </label>
+            </div>
+        </div>
     </div>
     <div id="result-banner" class="result-banner" style="display:none;"></div>
     <div id="progress-section" style="display:none;">
@@ -936,41 +1193,138 @@ var templates = map[string]string{
 {{end}}`,
 
 	"settings": `{{define "content"}}
-<div class="card">
-    <h2>Scheduled Verification</h2>
-    {{if .Message}}<p style="color:#3fb950;margin-bottom:12px;">{{.Message}}</p>{{end}}
-    <form method="POST" action="/settings" style="max-width:500px;">
+{{if .Message}}<div class="result-banner banner-success" style="max-width:640px;">{{.Message}}</div>{{end}}
+<form method="POST" action="/settings">
+<div class="settings-grid">
+
+    <!-- Scheduled Verification -->
+    <div class="card">
+        <h2>Scheduled Verification</h2>
         <div style="margin-bottom:16px;">
-            <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
-                <input type="checkbox" name="enabled" value="yes" {{if .Config.Enabled}}checked{{end}}
-                    style="width:16px;height:16px;">
+            <label class="opt-check">
+                <input type="checkbox" name="enabled" value="yes" {{if .Config.Enabled}}checked{{end}}>
                 <span>Enable scheduled verification</span>
             </label>
         </div>
-        <div style="margin-bottom:16px;">
-            <label style="display:block;margin-bottom:4px;color:#8b949e;font-size:12px;text-transform:uppercase;">
-                Cron Schedule
-            </label>
-            <input type="text" name="schedule" value="{{.Config.Schedule}}"
-                placeholder="0 3 * * 0"
-                style="width:100%;padding:8px 12px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#c9d1d9;font-size:14px;font-family:monospace;">
+        <div class="opt-group" style="margin-bottom:12px;">
+            <label>Cron Schedule</label>
+            <input type="text" name="schedule" value="{{.Config.Schedule}}" placeholder="0 3 * * 0"
+                style="font-family:'SFMono-Regular',Consolas,monospace;">
             <p class="text-muted" style="margin-top:4px;font-size:12px;">
-                Default: <code>0 3 * * 0</code> (Sunday 3:00 AM).
-                Uses standard cron syntax: minute hour day month weekday.
+                Default: <code>0 3 * * 0</code> (Sunday 3:00 AM). Standard cron: min hour day month weekday.
             </p>
         </div>
-        <div style="margin-bottom:16px;">
-            <label style="display:block;margin-bottom:4px;color:#8b949e;font-size:12px;text-transform:uppercase;">
-                Verify Mode
-            </label>
-            <select name="mode"
-                style="width:100%;padding:8px 12px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#c9d1d9;font-size:14px;">
+        <div class="opt-group">
+            <label>Verify Mode</label>
+            <select name="mode">
                 <option value="full" {{if eq .Config.Mode "full"}}selected{{end}}>Full -- re-hash every file</option>
                 <option value="quick" {{if eq .Config.Mode "quick"}}selected{{end}}>Quick -- skip unchanged files</option>
             </select>
         </div>
-        <button type="submit" class="btn btn-primary" style="padding:8px 20px;">Save Settings</button>
-    </form>
+    </div>
+
+    <!-- Scan Defaults -->
+    <div class="card">
+        <h2>Scan Defaults</h2>
+        <p class="text-muted" style="font-size:12px;margin-bottom:12px;">
+            These are used when starting a scan from the Overview page. Can be overridden per-operation.
+        </p>
+        <div class="opt-group" style="margin-bottom:12px;">
+            <label>Exclude Patterns (one regex per line)</label>
+            <textarea name="scan_excludes" rows="4" placeholder="\.tmp$&#10;/\.Trash-">{{.Config.ScanExcludes}}</textarea>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:10px;">
+            <label class="opt-check">
+                <input type="checkbox" name="scan_exclude_appdata" value="yes" {{if .Config.ScanExcludeAppdata}}checked{{end}}>
+                <span>Exclude appdata share</span>
+            </label>
+            <label class="opt-check">
+                <input type="checkbox" name="scan_full" value="yes" {{if .Config.ScanFull}}checked{{end}}>
+                <span>Full scan (re-hash all files, ignore incremental cache)</span>
+            </label>
+            <label class="opt-check">
+                <input type="checkbox" name="scan_hdd_two_phase" value="yes" {{if .Config.ScanHddTwoPhase}}checked{{end}}>
+                <span>HDD two-phase (walk first, then hash sequentially)</span>
+            </label>
+        </div>
+        <div class="opt-group" style="margin-top:12px;">
+            <label>Disk Type Override</label>
+            <select name="scan_disk_type">
+                <option value="auto" {{if eq .Config.ScanDiskType "auto"}}selected{{end}}>Auto-detect</option>
+                <option value="hdd" {{if eq .Config.ScanDiskType "hdd"}}selected{{end}}>HDD (all disks treated as HDD)</option>
+                <option value="ssd" {{if eq .Config.ScanDiskType "ssd"}}selected{{end}}>SSD (all disks treated as SSD)</option>
+            </select>
+        </div>
+    </div>
+
+    <!-- Verify Defaults -->
+    <div class="card">
+        <h2>Verify Defaults</h2>
+        <p class="text-muted" style="font-size:12px;margin-bottom:12px;">
+            These are used when starting a verify from the Overview page.
+        </p>
+        <div class="opt-group" style="margin-bottom:12px;">
+            <label>Worker Threads</label>
+            <input type="number" name="verify_workers" value="{{.Config.VerifyWorkers}}" min="1" max="64" style="max-width:100px;">
+            <p class="text-muted" style="margin-top:4px;font-size:12px;">
+                Concurrent file verification workers. Default: 4.
+            </p>
+        </div>
+        <label class="opt-check">
+            <input type="checkbox" name="verify_quick" value="yes" {{if .Config.VerifyQuick}}checked{{end}}>
+            <span>Quick verify (skip files whose size/mtime haven't changed)</span>
+        </label>
+    </div>
+
+    <!-- Thermal Protection -->
+    <div class="card">
+        <h2>Thermal Protection</h2>
+        <p class="text-muted" style="font-size:12px;margin-bottom:12px;">
+            Pause hashing on individual disks when they get too hot. Uses Unraid's cached disk temps with smartctl fallback.
+        </p>
+        <div style="margin-bottom:12px;">
+            <label class="opt-check">
+                <input type="checkbox" name="thermal_enabled" value="yes" {{if .Config.ThermalEnabled}}checked{{end}}>
+                <span>Enable thermal protection</span>
+            </label>
+        </div>
+        <div class="opt-group" style="margin-bottom:12px;">
+            <label>Poll Interval (seconds)</label>
+            <input type="number" name="thermal_poll_secs" value="{{.Config.ThermalPollSecs}}" min="10" max="600" style="max-width:100px;">
+        </div>
+        <div class="options-grid" style="gap:12px 20px;">
+            <div>
+                <p style="font-size:12px;font-weight:600;color:#e6edf3;margin-bottom:8px;">HDD Thresholds</p>
+                <div class="opt-group" style="margin-bottom:8px;">
+                    <label>Pause at (&deg;C)</label>
+                    <input type="number" name="thermal_hdd_pause" value="{{.Config.ThermalHddPause}}" min="30" max="80" style="max-width:80px;">
+                </div>
+                <div class="opt-group">
+                    <label>Resume at (&deg;C)</label>
+                    <input type="number" name="thermal_hdd_resume" value="{{.Config.ThermalHddResume}}" min="20" max="70" style="max-width:80px;">
+                </div>
+            </div>
+            <div>
+                <p style="font-size:12px;font-weight:600;color:#e6edf3;margin-bottom:8px;">SSD / NVMe Thresholds</p>
+                <div class="opt-group" style="margin-bottom:8px;">
+                    <label>Pause at (&deg;C)</label>
+                    <input type="number" name="thermal_ssd_pause" value="{{.Config.ThermalSsdPause}}" min="40" max="100" style="max-width:80px;">
+                </div>
+                <div class="opt-group">
+                    <label>Resume at (&deg;C)</label>
+                    <input type="number" name="thermal_ssd_resume" value="{{.Config.ThermalSsdResume}}" min="30" max="90" style="max-width:80px;">
+                </div>
+            </div>
+        </div>
+        <p class="text-muted" style="margin-top:8px;font-size:12px;">
+            Default: HDD 55/45&deg;C, SSD 70/60&deg;C. The 10&deg;C hysteresis prevents rapid on/off cycling.
+        </p>
+    </div>
+
 </div>
+<div style="margin-top:16px;max-width:640px;">
+    <button type="submit" class="btn btn-primary" style="padding:8px 24px;">Save All Settings</button>
+</div>
+</form>
 {{end}}`,
 }

@@ -290,6 +290,11 @@ type appConfig struct {
 	ThermalHddResume int
 	ThermalSsdPause  int
 	ThermalSsdResume int
+
+	// Do Not Disturb schedule
+	DndEnabled bool
+	DndStart   string // "HH:MM" format, e.g. "18:00"
+	DndEnd     string // "HH:MM" format, e.g. "23:00"
 }
 
 func defaultAppConfig() appConfig {
@@ -305,6 +310,8 @@ func defaultAppConfig() appConfig {
 		ThermalHddResume: 45,
 		ThermalSsdPause:  70,
 		ThermalSsdResume: 60,
+		DndStart:         "18:00",
+		DndEnd:           "06:00",
 	}
 }
 
@@ -389,6 +396,14 @@ func readAppConfig() appConfig {
 			if n, err := strconv.Atoi(val); err == nil && n > 0 {
 				cfg.ThermalSsdResume = n
 			}
+
+		// Do Not Disturb
+		case "DND_ENABLED":
+			cfg.DndEnabled = val == "yes"
+		case "DND_START":
+			cfg.DndStart = val
+		case "DND_END":
+			cfg.DndEnd = val
 		}
 	}
 	return cfg
@@ -424,6 +439,11 @@ THERMAL_HDD_PAUSE=%d
 THERMAL_HDD_RESUME=%d
 THERMAL_SSD_PAUSE=%d
 THERMAL_SSD_RESUME=%d
+
+# Do Not Disturb schedule
+DND_ENABLED=%s
+DND_START=%s
+DND_END=%s
 `,
 		boolToYesNo(cfg.Enabled), cfg.Schedule, cfg.Mode,
 		excludesEncoded, boolToYesNo(cfg.ScanExcludeAppdata),
@@ -432,6 +452,7 @@ THERMAL_SSD_RESUME=%d
 		boolToYesNo(cfg.ThermalEnabled), cfg.ThermalPollSecs,
 		cfg.ThermalHddPause, cfg.ThermalHddResume,
 		cfg.ThermalSsdPause, cfg.ThermalSsdResume,
+		boolToYesNo(cfg.DndEnabled), cfg.DndStart, cfg.DndEnd,
 	)
 
 	if err := os.MkdirAll("/boot/config/filehasher", 0755); err != nil {
@@ -484,6 +505,15 @@ func (c appConfig) toThermalConfig() ThermalConfig {
 		HddResume: c.ThermalHddResume,
 		SsdPause:  c.ThermalSsdPause,
 		SsdResume: c.ThermalSsdResume,
+	}
+}
+
+// toDndConfig converts saved config to DndConfig.
+func (c appConfig) toDndConfig() DndConfig {
+	return DndConfig{
+		Enabled: c.DndEnabled,
+		Start:   c.DndStart,
+		End:     c.DndEnd,
 	}
 }
 
@@ -549,6 +579,17 @@ func handleSettings() http.HandlerFunc {
 				if n, err := strconv.Atoi(v); err == nil && n > 0 {
 					cfg.ThermalSsdResume = n
 				}
+			}
+
+			// Do Not Disturb
+			cfg.DndEnabled = r.FormValue("dnd_enabled") == "yes"
+			cfg.DndStart = r.FormValue("dnd_start")
+			cfg.DndEnd = r.FormValue("dnd_end")
+			if cfg.DndStart == "" {
+				cfg.DndStart = "18:00"
+			}
+			if cfg.DndEnd == "" {
+				cfg.DndEnd = "06:00"
 			}
 
 			err := writeAppConfig(cfg)
@@ -640,7 +681,7 @@ func handleAPIScan(runner *Runner) http.HandlerFunc {
 			}
 		}
 
-		if err := runner.StartScan(opts, thermal); err != nil {
+		if err := runner.StartScan(opts, thermal, cfg.toDndConfig()); err != nil {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusConflict)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
@@ -679,7 +720,7 @@ func handleAPIVerify(runner *Runner) http.HandlerFunc {
 			}
 		}
 
-		if err := runner.StartVerify(opts, thermal); err != nil {
+		if err := runner.StartVerify(opts, thermal, cfg.toDndConfig()); err != nil {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusConflict)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
@@ -698,10 +739,12 @@ func handleAPIConfig() http.HandlerFunc {
 			Scan    ScanOptions   `json:"scan"`
 			Verify  VerifyOptions `json:"verify"`
 			Thermal ThermalConfig `json:"thermal"`
+			Dnd     DndConfig     `json:"dnd"`
 		}{
 			Scan:    cfg.toScanOptions(),
 			Verify:  cfg.toVerifyOptions(),
 			Thermal: cfg.toThermalConfig(),
+			Dnd:     cfg.toDndConfig(),
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("X-Content-Type-Options", "nosniff")

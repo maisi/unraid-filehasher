@@ -34,9 +34,10 @@ type Summary struct {
 
 // Verifier checks files against their stored hashes.
 type Verifier struct {
-	db      *db.DB
-	workers int
-	quick   bool // only check files with changed mtime/size
+	db        *db.DB
+	workers   int
+	quick     bool                        // only check files with changed mtime/size
+	PauseFunc func(context.Context) error // optional: called before feeding each file (e.g. DnD pause)
 }
 
 // New creates a new Verifier.
@@ -138,6 +139,13 @@ func (v *Verifier) verifyFiles(ctx context.Context, files []*db.FileRecord, resu
 				skippedCount.Add(1)
 				updateProgress(1)
 				continue
+			}
+
+			// Pause hook (e.g. DnD window)
+			if v.PauseFunc != nil {
+				if err := v.PauseFunc(ctx); err != nil {
+					return
+				}
 			}
 
 			input <- hasher.FileInfo{Path: f.Path, Disk: f.Disk}

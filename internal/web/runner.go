@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -41,6 +42,97 @@ type ThermalConfig struct {
 	HddResume int  `json:"hddResume"`
 	SsdPause  int  `json:"ssdPause"`
 	SsdResume int  `json:"ssdResume"`
+}
+
+// DndConfig holds Do Not Disturb schedule parameters.
+type DndConfig struct {
+	Enabled bool   `json:"enabled"`
+	Start   string `json:"start"` // "HH:MM"
+	End     string `json:"end"`   // "HH:MM"
+}
+
+// dndPauseState tracks global DnD pause state using the same channel pattern
+// as diskThermalState — a closed channel means "running", an open one blocks.
+type dndPauseState struct {
+	paused int32         // atomic: 1 = paused, 0 = running
+	ch     chan struct{} // closed when unpaused, re-created on pause
+	mu     sync.Mutex
+}
+
+func newDndPauseState() *dndPauseState {
+	ch := make(chan struct{})
+	close(ch) // start unpaused
+	return &dndPauseState{ch: ch}
+}
+
+func (d *dndPauseState) pause() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if atomic.LoadInt32(&d.paused) == 0 {
+		atomic.StoreInt32(&d.paused, 1)
+		d.ch = make(chan struct{})
+	}
+}
+
+func (d *dndPauseState) resume() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if atomic.LoadInt32(&d.paused) == 1 {
+		atomic.StoreInt32(&d.paused, 0)
+		close(d.ch)
+	}
+}
+
+func (d *dndPauseState) isPaused() bool {
+	return atomic.LoadInt32(&d.paused) == 1
+}
+
+func (d *dndPauseState) waitIfPaused(ctx context.Context) error {
+	d.mu.Lock()
+	ch := d.ch
+	d.mu.Unlock()
+	select {
+	case <-ch:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// parseHHMM parses "HH:MM" into hour and minute. Returns -1,-1 on error.
+func parseHHMM(s string) (int, int) {
+	parts := strings.SplitN(s, ":", 2)
+	if len(parts) != 2 {
+		return -1, -1
+	}
+	h, err1 := strconv.Atoi(parts[0])
+	m, err2 := strconv.Atoi(parts[1])
+	if err1 != nil || err2 != nil || h < 0 || h > 23 || m < 0 || m > 59 {
+		return -1, -1
+	}
+	return h, m
+}
+
+// isInDndWindow checks if the current time falls within the DnD window.
+// Handles midnight wrapping: if start > end (e.g. 23:00-06:00), the window
+// is active when now >= start OR now < end.
+func isInDndWindow(now time.Time, startStr, endStr string) bool {
+	sh, sm := parseHHMM(startStr)
+	eh, em := parseHHMM(endStr)
+	if sh < 0 || eh < 0 {
+		return false // invalid times, never active
+	}
+
+	nowMin := now.Hour()*60 + now.Minute()
+	startMin := sh*60 + sm
+	endMin := eh*60 + em
+
+	if startMin < endMin {
+		// Same-day window: e.g. 09:00-17:00
+		return nowMin >= startMin && nowMin < endMin
+	}
+	// Crosses midnight: e.g. 23:00-06:00
+	return nowMin >= startMin || nowMin < endMin
 }
 
 // diskThermalState tracks per-disk thermal pause state.
@@ -114,14 +206,15 @@ type DiskProgress struct {
 
 // RunnerProgress holds current progress information.
 type RunnerProgress struct {
-	State   RunnerState    `json:"state"`
-	Phase   string         `json:"phase"`   // e.g., "walking", "hashing", "verifying", "complete", "cancelled", "error"
-	Done    int64          `json:"done"`    // files processed so far
-	Total   int64          `json:"total"`   // total files (0 if unknown)
-	Errors  int64          `json:"errors"`  // error count
-	Started time.Time      `json:"started"` // when current op started
-	Message string         `json:"message"` // latest status message
-	Disks   []DiskProgress `json:"disks"`   // per-disk progress (nil when idle with no history)
+	State     RunnerState    `json:"state"`
+	Phase     string         `json:"phase"`     // e.g., "walking", "hashing", "verifying", "complete", "cancelled", "error"
+	Done      int64          `json:"done"`      // files processed so far
+	Total     int64          `json:"total"`     // total files (0 if unknown)
+	Errors    int64          `json:"errors"`    // error count
+	Started   time.Time      `json:"started"`   // when current op started
+	Message   string         `json:"message"`   // latest status message
+	Disks     []DiskProgress `json:"disks"`     // per-disk progress (nil when idle with no history)
+	DnDPaused bool           `json:"dndPaused"` // true if globally paused due to DnD schedule
 }
 
 // Runner manages background scan and verify operations.
@@ -218,7 +311,7 @@ func (r *Runner) Stop() error {
 }
 
 // StartScan begins a background scan operation. Returns an error if already busy.
-func (r *Runner) StartScan(opts ScanOptions, thermal ThermalConfig) error {
+func (r *Runner) StartScan(opts ScanOptions, thermal ThermalConfig, dnd DndConfig) error {
 	r.mu.Lock()
 	if r.progress.State != StateIdle {
 		r.mu.Unlock()
@@ -234,12 +327,12 @@ func (r *Runner) StartScan(opts ScanOptions, thermal ThermalConfig) error {
 	r.mu.Unlock()
 	r.notify(r.Progress())
 
-	go r.runScan(ctx, opts, thermal)
+	go r.runScan(ctx, opts, thermal, dnd)
 	return nil
 }
 
 // StartVerify begins a background verify operation. Returns an error if already busy.
-func (r *Runner) StartVerify(opts VerifyOptions, thermal ThermalConfig) error {
+func (r *Runner) StartVerify(opts VerifyOptions, thermal ThermalConfig, dnd DndConfig) error {
 	r.mu.Lock()
 	if r.progress.State != StateIdle {
 		r.mu.Unlock()
@@ -255,7 +348,7 @@ func (r *Runner) StartVerify(opts VerifyOptions, thermal ThermalConfig) error {
 	r.mu.Unlock()
 	r.notify(r.Progress())
 
-	go r.runVerify(ctx, opts, thermal)
+	go r.runVerify(ctx, opts, thermal, dnd)
 	return nil
 }
 
@@ -278,7 +371,7 @@ func (r *Runner) finishOperation(phase string, done, total, errors int64, messag
 	r.notify(snap)
 }
 
-func (r *Runner) runScan(ctx context.Context, opts ScanOptions, thermalCfg ThermalConfig) {
+func (r *Runner) runScan(ctx context.Context, opts ScanOptions, thermalCfg ThermalConfig, dndCfg DndConfig) {
 	// Detect Unraid disks
 	disks, err := scanner.DetectUnraidDisks()
 	if err != nil || len(disks) == 0 {
@@ -388,6 +481,15 @@ func (r *Runner) runScan(ctx context.Context, opts ScanOptions, thermalCfg Therm
 		go r.thermalMonitor(thermalCtx, thermalCfg, thermalStates, diskTypes, diskProgressMap)
 	}
 
+	// Start DnD monitor if enabled
+	dndState := newDndPauseState()
+	var dndCancel context.CancelFunc
+	if dndCfg.Enabled {
+		var dndCtx context.Context
+		dndCtx, dndCancel = context.WithCancel(ctx)
+		go r.dndMonitor(dndCtx, dndCfg, dndState)
+	}
+
 	// Launch per-disk pipelines
 	var pipelineWg sync.WaitGroup
 	for _, d := range disks {
@@ -452,9 +554,12 @@ func (r *Runner) runScan(ctx context.Context, opts ScanOptions, thermalCfg Therm
 
 				dp.Phase = "hashing"
 
-				// Phase 2: feed sequentially (respecting thermal pause)
+				// Phase 2: feed sequentially (respecting thermal + DnD pause)
 				for _, fi := range list {
 					if err := ts.waitIfPaused(ctx); err != nil {
+						return
+					}
+					if err := dndState.waitIfPaused(ctx); err != nil {
 						return
 					}
 					select {
@@ -489,6 +594,11 @@ func (r *Runner) runScan(ctx context.Context, opts ScanOptions, thermalCfg Therm
 
 					// Thermal pause
 					if err := ts.waitIfPaused(ctx); err != nil {
+						return
+					}
+
+					// DnD pause
+					if err := dndState.waitIfPaused(ctx); err != nil {
 						return
 					}
 
@@ -533,6 +643,9 @@ func (r *Runner) runScan(ctx context.Context, opts ScanOptions, thermalCfg Therm
 	if txErr != nil {
 		if thermalCancel != nil {
 			thermalCancel()
+		}
+		if dndCancel != nil {
+			dndCancel()
 		}
 		r.finishOperation("error", 0, 0, 0, fmt.Sprintf("begin transaction: %v", txErr), nil)
 		return
@@ -623,6 +736,9 @@ func (r *Runner) runScan(ctx context.Context, opts ScanOptions, thermalCfg Therm
 				if thermalCancel != nil {
 					thermalCancel()
 				}
+				if dndCancel != nil {
+					dndCancel()
+				}
 				r.finishOperation("error", atomic.LoadInt64(&totalProcessed), 0, atomic.LoadInt64(&totalErrors),
 					fmt.Sprintf("commit batch: %v", err), cloneDiskProgress(diskProgressList))
 				return
@@ -631,6 +747,9 @@ func (r *Runner) runScan(ctx context.Context, opts ScanOptions, thermalCfg Therm
 			if txErr != nil {
 				if thermalCancel != nil {
 					thermalCancel()
+				}
+				if dndCancel != nil {
+					dndCancel()
 				}
 				r.finishOperation("error", atomic.LoadInt64(&totalProcessed), 0, atomic.LoadInt64(&totalErrors),
 					fmt.Sprintf("begin new batch: %v", txErr), cloneDiskProgress(diskProgressList))
@@ -665,6 +784,10 @@ func (r *Runner) runScan(ctx context.Context, opts ScanOptions, thermalCfg Therm
 	// Stop thermal monitor
 	if thermalCancel != nil {
 		thermalCancel()
+	}
+	// Stop DnD monitor
+	if dndCancel != nil {
+		dndCancel()
 	}
 
 	// Handle cancellation
@@ -724,9 +847,24 @@ func (r *Runner) runScan(ctx context.Context, opts ScanOptions, thermalCfg Therm
 		cloneDiskProgress(diskProgressList))
 }
 
-func (r *Runner) runVerify(ctx context.Context, opts VerifyOptions, thermalCfg ThermalConfig) {
+func (r *Runner) runVerify(ctx context.Context, opts VerifyOptions, thermalCfg ThermalConfig, dndCfg DndConfig) {
 	scanID, _ := r.db.InsertScanHistory("verify", "")
 	v := verifier.New(r.db, opts.Workers, opts.Quick)
+
+	// Start DnD monitor if enabled
+	dndState := newDndPauseState()
+	var dndCancel context.CancelFunc
+	if dndCfg.Enabled {
+		var dndCtx context.Context
+		dndCtx, dndCancel = context.WithCancel(ctx)
+		go r.dndMonitor(dndCtx, dndCfg, dndState)
+		v.PauseFunc = dndState.waitIfPaused
+	}
+	defer func() {
+		if dndCancel != nil {
+			dndCancel()
+		}
+	}()
 
 	// Load files to build per-disk progress
 	allFiles, err := r.db.GetAllFiles()
@@ -925,6 +1063,46 @@ func (r *Runner) thermalMonitor(
 			r.updateProgress(func(p *RunnerProgress) {
 				// The disk progress slice is shared; just trigger a clone+notify
 			})
+		}
+	}
+}
+
+// dndMonitor checks the current time against the DnD window every 30 seconds
+// and pauses/resumes all hashing globally. It runs in a goroutine until ctx is cancelled.
+func (r *Runner) dndMonitor(ctx context.Context, cfg DndConfig, state *dndPauseState) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	// Check immediately on start
+	check := func() {
+		inWindow := isInDndWindow(time.Now(), cfg.Start, cfg.End)
+		wasPaused := state.isPaused()
+
+		if inWindow && !wasPaused {
+			state.pause()
+			log.Printf("dnd: entering Do Not Disturb window (%s-%s), pausing all operations", cfg.Start, cfg.End)
+			r.updateProgress(func(p *RunnerProgress) {
+				p.DnDPaused = true
+			})
+		} else if !inWindow && wasPaused {
+			state.resume()
+			log.Printf("dnd: leaving Do Not Disturb window (%s-%s), resuming operations", cfg.Start, cfg.End)
+			r.updateProgress(func(p *RunnerProgress) {
+				p.DnDPaused = false
+			})
+		}
+	}
+
+	check()
+
+	for {
+		select {
+		case <-ctx.Done():
+			// Ensure we resume on shutdown so goroutines don't hang
+			state.resume()
+			return
+		case <-ticker.C:
+			check()
 		}
 	}
 }

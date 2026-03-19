@@ -679,6 +679,16 @@ var baseTemplate = `<!DOCTYPE html>
                 if (barEl) barEl.style.width = pct + "%";
                 if (barEl) { barEl.className = "progress-bar"; }
 
+                // DnD paused indicator
+                var dndEl = document.getElementById("dnd-paused-banner");
+                if (dndEl) {
+                    if (p.dndPaused) {
+                        dndEl.style.display = "block";
+                    } else {
+                        dndEl.style.display = "none";
+                    }
+                }
+
                 // Speed calculation
                 if (speedEl && opStartTime && doneBytes > 0) {
                     var elapsedSec = (Date.now() - opStartTime) / 1000;
@@ -701,6 +711,9 @@ var baseTemplate = `<!DOCTYPE html>
                 if (btnScan) btnScan.disabled = false;
                 if (btnVerify) btnVerify.disabled = false;
                 if (btnStop) btnStop.style.display = "none";
+
+                var dndEl2 = document.getElementById("dnd-paused-banner");
+                if (dndEl2) dndEl2.style.display = "none";
 
                 if (p.phase === "complete" || p.phase === "cancelled" || p.phase === "error") {
                     // Show result banner
@@ -929,6 +942,9 @@ var templates = map[string]string{
         </div>
         <div class="progress-bar-container">
             <div id="progress-bar" class="progress-bar" style="width:0%"></div>
+        </div>
+        <div id="dnd-paused-banner" class="result-banner banner-cancelled" style="display:none;margin-top:8px;">
+            Do Not Disturb active &mdash; all operations paused until the DnD window ends.
         </div>
         <p id="progress-message" class="text-muted" style="margin-top:8px;font-size:13px;"></p>
         <div id="disk-progress-list" class="disk-progress-list"></div>
@@ -1318,6 +1334,34 @@ var templates = map[string]string{
         </div>
         <p class="text-muted" style="margin-top:8px;font-size:12px;">
             Default: HDD 55/45&deg;C, SSD 70/60&deg;C. The 10&deg;C hysteresis prevents rapid on/off cycling.
+        </p>
+    </div>
+
+    <!-- Do Not Disturb -->
+    <div class="card">
+        <h2>Do Not Disturb</h2>
+        <p class="text-muted" style="font-size:12px;margin-bottom:12px;">
+            Pause all hashing operations during a daily time window. Useful for media playback hours.
+            The current file finishes hashing before pausing.
+        </p>
+        <div style="margin-bottom:12px;">
+            <label class="opt-check">
+                <input type="checkbox" name="dnd_enabled" value="yes" {{if .Config.DndEnabled}}checked{{end}}>
+                <span>Enable Do Not Disturb schedule</span>
+            </label>
+        </div>
+        <div class="options-grid" style="gap:12px 20px;">
+            <div class="opt-group">
+                <label>Start Time</label>
+                <input type="time" name="dnd_start" value="{{.Config.DndStart}}" style="max-width:140px;">
+            </div>
+            <div class="opt-group">
+                <label>End Time</label>
+                <input type="time" name="dnd_end" value="{{.Config.DndEnd}}" style="max-width:140px;">
+            </div>
+        </div>
+        <p class="text-muted" style="margin-top:8px;font-size:12px;">
+            Default: 18:00&ndash;06:00. Supports overnight windows (start &gt; end wraps past midnight).
         </p>
     </div>
 

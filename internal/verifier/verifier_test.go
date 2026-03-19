@@ -1,10 +1,12 @@
 package verifier
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -254,5 +256,144 @@ func TestNewVerifierDefaultWorkers(t *testing.T) {
 	v = New(nil, -1, false)
 	if v.workers != 4 {
 		t.Errorf("workers = %d, want 4 (negative input)", v.workers)
+	}
+}
+
+func TestVerifyPauseFunc(t *testing.T) {
+	database := setupTestDB(t)
+	dir := t.TempDir()
+
+	// Create a real file
+	path := filepath.Join(dir, "test.txt")
+	content := []byte("pause test\n")
+	hash := writeTestFile(t, path, content)
+
+	stat, _ := os.Stat(path)
+	now := time.Now()
+
+	tx, _ := database.BeginBatch()
+	database.UpsertFileTx(tx, &db.FileRecord{
+		Path: path, Disk: "disk1", Size: stat.Size(), Mtime: stat.ModTime().Unix(),
+		SHA256: hash, FirstSeen: now, LastVerified: now, Status: "ok",
+	})
+	tx.Commit()
+
+	// Track how many times PauseFunc was called
+	var pauseCount int
+	v := New(database, 1, false)
+	v.PauseFunc = func(ctx context.Context) error {
+		pauseCount++
+		return nil
+	}
+
+	summary, err := v.VerifyAllContext(context.Background(), func(vr VerifyResult) {}, nil)
+	if err != nil {
+		t.Fatalf("VerifyAll: %v", err)
+	}
+
+	if pauseCount != 1 {
+		t.Errorf("PauseFunc called %d times, want 1", pauseCount)
+	}
+	if summary.OK != 1 {
+		t.Errorf("OK = %d, want 1", summary.OK)
+	}
+}
+
+func TestVerifyThermalPauseFunc(t *testing.T) {
+	database := setupTestDB(t)
+	dir := t.TempDir()
+
+	// Create files on two different "disks"
+	path1 := filepath.Join(dir, "file1.txt")
+	content1 := []byte("disk1 content\n")
+	hash1 := writeTestFile(t, path1, content1)
+	stat1, _ := os.Stat(path1)
+
+	path2 := filepath.Join(dir, "file2.txt")
+	content2 := []byte("disk2 content\n")
+	hash2 := writeTestFile(t, path2, content2)
+	stat2, _ := os.Stat(path2)
+
+	now := time.Now()
+	tx, _ := database.BeginBatch()
+	database.UpsertFileTx(tx, &db.FileRecord{
+		Path: path1, Disk: "disk1", Size: stat1.Size(), Mtime: stat1.ModTime().Unix(),
+		SHA256: hash1, FirstSeen: now, LastVerified: now, Status: "ok",
+	})
+	database.UpsertFileTx(tx, &db.FileRecord{
+		Path: path2, Disk: "disk2", Size: stat2.Size(), Mtime: stat2.ModTime().Unix(),
+		SHA256: hash2, FirstSeen: now, LastVerified: now, Status: "ok",
+	})
+	tx.Commit()
+
+	// Track per-disk thermal pause calls
+	var mu sync.Mutex
+	thermalPauseCalls := make(map[string]int)
+
+	v := New(database, 1, false)
+	v.ThermalPauseFunc = func(ctx context.Context, diskName string) error {
+		mu.Lock()
+		thermalPauseCalls[diskName]++
+		mu.Unlock()
+		return nil
+	}
+
+	summary, err := v.VerifyAllContext(context.Background(), func(vr VerifyResult) {}, nil)
+	if err != nil {
+		t.Fatalf("VerifyAll: %v", err)
+	}
+
+	if summary.OK != 2 {
+		t.Errorf("OK = %d, want 2", summary.OK)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if thermalPauseCalls["disk1"] != 1 {
+		t.Errorf("ThermalPauseFunc for disk1 called %d times, want 1", thermalPauseCalls["disk1"])
+	}
+	if thermalPauseCalls["disk2"] != 1 {
+		t.Errorf("ThermalPauseFunc for disk2 called %d times, want 1", thermalPauseCalls["disk2"])
+	}
+}
+
+func TestVerifyThermalPauseFuncCancellation(t *testing.T) {
+	database := setupTestDB(t)
+	dir := t.TempDir()
+
+	// Create a real file
+	path := filepath.Join(dir, "test.txt")
+	content := []byte("cancel test\n")
+	hash := writeTestFile(t, path, content)
+
+	stat, _ := os.Stat(path)
+	now := time.Now()
+
+	tx, _ := database.BeginBatch()
+	database.UpsertFileTx(tx, &db.FileRecord{
+		Path: path, Disk: "disk1", Size: stat.Size(), Mtime: stat.ModTime().Unix(),
+		SHA256: hash, FirstSeen: now, LastVerified: now, Status: "ok",
+	})
+	tx.Commit()
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// ThermalPauseFunc that cancels on first call — the feeder goroutine exits
+	// before feeding any files, so verify completes with 0 hashed files.
+	v := New(database, 1, false)
+	v.ThermalPauseFunc = func(ctx context.Context, diskName string) error {
+		cancel()
+		return ctx.Err()
+	}
+
+	summary, err := v.VerifyAllContext(ctx, func(vr VerifyResult) {}, nil)
+	// The feeder exits early without feeding any file, so the hasher output
+	// channel closes immediately. The result loop may or may not see the
+	// cancelled context depending on timing. Either way, no files get hashed.
+	if err != nil && err != context.Canceled {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if summary != nil && summary.TotalChecked > 0 {
+		t.Errorf("TotalChecked = %d, want 0 (feeder was cancelled)", summary.TotalChecked)
 	}
 }

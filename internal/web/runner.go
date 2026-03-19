@@ -890,9 +890,44 @@ func (r *Runner) runVerify(ctx context.Context, opts VerifyOptions, thermalCfg T
 			Phase:      "verifying",
 			FilesFound: count,
 			BytesTotal: diskByteCounts[disk],
+			Temp:       -1,
 		})
 		diskProgressMap[disk] = &diskProgressList[len(diskProgressList)-1]
 	}
+
+	// Set up per-disk thermal state and start thermal monitor if enabled
+	thermalStates := make(map[string]*diskThermalState, len(diskFileCounts))
+	var thermalCancel context.CancelFunc
+	if thermalCfg.Enabled {
+		// Detect disk types for thermal thresholds.
+		// We need device types to apply the correct HDD/SSD thresholds.
+		detectedDisks, _ := scanner.DetectUnraidDisks()
+		diskTypes := make(map[string]scanner.DiskType, len(detectedDisks))
+		for _, d := range detectedDisks {
+			diskTypes[d.Name] = d.Type
+		}
+
+		for disk := range diskFileCounts {
+			thermalStates[disk] = newDiskThermalState()
+		}
+
+		var thermalCtx context.Context
+		thermalCtx, thermalCancel = context.WithCancel(ctx)
+		go r.thermalMonitor(thermalCtx, thermalCfg, thermalStates, diskTypes, diskProgressMap)
+
+		// Wire per-disk thermal pause into verifier
+		v.ThermalPauseFunc = func(ctx context.Context, diskName string) error {
+			if ts, ok := thermalStates[diskName]; ok {
+				return ts.waitIfPaused(ctx)
+			}
+			return nil
+		}
+	}
+	defer func() {
+		if thermalCancel != nil {
+			thermalCancel()
+		}
+	}()
 
 	total := int64(len(allFiles))
 
@@ -903,8 +938,20 @@ func (r *Runner) runVerify(ctx context.Context, opts VerifyOptions, thermalCfg T
 		p.Message = fmt.Sprintf("Verifying %d files across %d disks", total, len(diskFileCounts))
 	})
 
+	// Build lookup for per-disk byte tracking from the loaded file records
+	fileRecordMap := make(map[string]*db.FileRecord, len(allFiles))
+	for _, f := range allFiles {
+		fileRecordMap[f.Path] = f
+	}
+
 	resultCb := func(vr verifier.VerifyResult) {
-		// No-op for web — progress is tracked via progressCb
+		// Track per-disk progress
+		if rec, ok := fileRecordMap[vr.Path]; ok {
+			if dp, ok2 := diskProgressMap[rec.Disk]; ok2 {
+				atomic.AddInt64(&dp.FilesDone, 1)
+				atomic.AddInt64(&dp.BytesDone, rec.Size)
+			}
+		}
 	}
 
 	var verifyDone int64
